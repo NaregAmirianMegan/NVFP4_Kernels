@@ -1,0 +1,38 @@
+# Virtual environments
+env
+venv
+.venv
+path
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.tox
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE and editor files
+.DS_Store
+*.swp
+*.swo
+*~
+.idea
+.vscode
+*.sublime-*
+
+# Build artifacts
+*.egg-info
+dist
+build
+*.so
+*.dylib
+
+# Other
+.env
+*.log

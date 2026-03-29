@@ -1,0 +1,34 @@
+- See how much time cutting down on K saves, this informs how much room split-K gives us for gains
+- Implement TMA multi-cast, this will significantly reduce GMEM/L2 traffic and misses
+- Figure out where the bottleneck is (is it TMA (multi-cast will help), is it MMA?)
+
+
+- Play with really small K sizes to see what's actually bottlnecking the small kernels
+- What's the smallest N size, is there a way computing the transpose could utilize hardware better?
+
+- TMA descriptor prefetching
+- Look at cutlass examples for other ideas
+
+
+- Overlap tile computation?
+- DSMEM split-k
+- TMA-multicast
+
+
+Tuning:
+- Cache hints
+- tile sizes
+- pipeline stages
+
+
+
+
+- Look at proofing wrap-around for Tile pipeline
+- Swap in CLC to see if that improves performance
+- Multi-cast (better way to schedule?)
+- DSMEM split-k
+- two TMEM allocs and 3 stage TMEM buffer
+- TMA prefetch
+- Interleave copy and mma
+
+- If splitting problem into more tiles can separate work tile computation and tmap updates stages

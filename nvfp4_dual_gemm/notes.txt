@@ -1,0 +1,19 @@
+Improvement Ideas:
+- All the stuff in v2
+   - Multi-cast
+   - Split-K for smaller M-dim matrices
+- Overlap tcgen05.cp with tcgen05.mma
+- Persistant Kernels
+- Different swizzling patterns (if supported)
+- Improve epilogue
+- Overlap epilogue somehow
+- Swizzle scale factor loads
+- Different cache eviction policies for L2
+- Persistent kernels
+
+- Split-K with DSMEM
+   - Potential bugs:
+      - Output buffer alignment if using TMA
+      - Do static SMEM buffers work with DSMEM?
+
+

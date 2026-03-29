@@ -1,0 +1,2 @@
+Split-K not implemented for block-scaled kernels in CUTLASS
+O3 is improves runtime a ton, why? (can compare assembly dumps)

@@ -1,0 +1,125 @@
+Our naive implementation handles one batch at a time, calling torch._scaled_mm which calls
+into PyTorch internally optimized blockscaled GEMV operations. Profiling this kernel we can
+see a number of issues: 
+
+* Tensor cores are completely unused, and it seems like there should
+  be a way to use tensor cores effectively for a batched GEMV (which 
+  is essentially just a bunch of GEMMs with the dimensions switched 
+  around)
+* Our memory throughput is poor by every metric: L1/L2 cache hit rates 
+  are very low, shared memory is unused, long scoreboard stalls are 
+  very high (the highest amongst all stalls, which means our computation
+  is primarily being halted by waiting on data to arrive in registers), 
+  we see a large amount of uncoalesced accesses to global memory in addition
+  to the sectors/request ratio being 8 for loads. A sector is the smallest 
+  unit of data that can be loaded from the L1 cache and a request is the 
+  collection of loads/stores issued by all threads in a warp. So it is an
+  indicator of uncoalesced accesses when we have a higher sectors/request
+  ratio.
+* Our compute throughput is also quite low. This might be partially because
+  the problem size is rather small, but it's also due to compute stalling
+  and waiting for memory ops frequently.
+* Occupancy is at 65% which at face value isn't necessarily a bad thing, as
+  occupancy doesn't have a direct relationship with compute performance in 
+  most cases; however, it's something to consider as we design and test our
+  kernel.
+* Algorithmically it seems flawed, especially when we consider how massively
+  parallel processors should be utilized, to compute one batch at a time
+  serially. It seems like there should be a way to compute parts of multiple
+  batches at a time to better utilize all compute units in the GPU. This links
+  us back to our first point of using tensor cores and block-scaled MMA ops.
+
+
+So how do we design our kernel? 
+
+In general it's helfpul to look separately at how data is being moved in the GPU and how it 
+is used to compute results. This will allow us to more simply improve our kernel iteratively, 
+implementing and swapping in/out different techniques. 
+
+
+A more detailed view of our naive kernel:
+
+
+
+In our naive kernel we handle one batch at a time, only starting computation on the next batch
+after the previous has completed in its entirety. Since our compute is so underutilized a natural
+step forward would be to try to handle multiple batches at a time.
+
+Taking this a step further, handling multiple batches within the same kernel call avoid kernel
+launch overhead, and allows for more fine-grained latency hiding techniques to be employed.
+
+v1: naive
+v2: blocking along k, each CTA computes an output element
+v3: incorporate warp shuffle into summation reduction
+v4: have each warp compute certain number of outputs, each CTA computes a fragment of the output (with each warp contributing a single output)
+    this improves coalescense, and allows for pipelining memory ops into SMEM to hide memory op latency
+
+Optimizations:
+- swizzling to avoid SMEM bank conflicts
+- warp shuffle reduction
+- coalesced / vectorized load/stores
+- better blocking / algorithm
+- tuning
+- use DSMEM / reduce redundant GMEM loads
+- scale value multiplications are independent of value multiplications so they can be parallelized
+- pipelining using async/TMA to hide memory latency
+
+
+After v4:
+- Our sectors/requests is way down on loads (nearing 4 which is optimal for 128B transactions), indicating our
+  loads are now being effectively coalesced
+- However, our compute throughput is high while our memory/cache bandwidth and cache hit rates are both low. This
+  indicates that although our accesses are coalesced our algorithm isn't structured in a way that maximizes the memory bandwidth. 
+  This is likely because we issue our global reads inside loops serialized with computation, so we our mem op issue rate is too low.
+  Additionally, our occupancy is somewhat low at about 50% indicating there aren't enough active warps resident on SMs to hide memory 
+  latency. To fix the first issue we can perform computation in stages of memory loads -> compute ops via SMEM/DSMEM (this can later
+  be pipelined to further hide latency). Additionally we need to look at exactly why our occupancy is low (e.g. register pressure, 
+  CTA size, partial last wave) and address this so we can increase occupancy and better hide memory latency (this will be especially
+  important when pipelining memory ops with compute ops)
+- Use tensor cores to improve inner-most loop efficiency
+
+
+
+
+Removing our redundant __syncthreads() call improved our SMEM caching runtime back to baseline, and we improved upon it to about 115us geom avg
+with better index calculation schemes. 
+
+However, our runtime is still being dominated by the ALU, which explains why pipelining didn't help at least initially, because we aren't memory bound (i.e.
+"compute" is dominating our runtime). The main culprits are LOP3, PRMT, and IMAD instructions. We can take some steps to try and greatly reduce the number
+of these instructions in the kernel, which should bring us to an inflection point where we stop seeing so many stalls and experience a large increase in
+performance. This will also allow us to see more performance gains for future memory targeted techniques (like pipelining).
+
+Reduce logical ops in ALU:
+-> reduce reinterperet casts
+-> reduce index calculation
+
+
+In turns out CUDA intrinsics were doing logical bit manipulation to do type conversions, bogging down our computation. The sm_100a architecture provides
+dedicated type conversion instructions however, these weren't being used in out compiled binary. The reason for this is we weren't compiling for arch
+sm_100a, but even when we do and some of those instructions get used there is still unnecessary conversion math happening, converting to raw then real
+types. By writing with raw PTX we give ourselves the granularity required to most efficiently perform the type conversions. In v0_ptx each thread in 
+the warp now handles 32 NVFP4 elements, allowing float4 vectorized loads, and warp wide accumulation is done in half precision, although full k-dim
+accumulation is still done in single precision before converting back to half precision to store.
+
+Compiling with arch=sm_100a brings our runtime down by about 3x, converting to PTX and doing the aforementioned modifications results in ~5x speedup, so
+our geom metric mean sits at about 29us now.
+
+Now we need to re-examine our bottlnecks to see how to further improve.
+
+
+
+Plan moving forward:
+
+-> Implement async data transfer with TMA
+-> Generalize algorithm to support different amounts of results per warp / warps per CTA (should just need to adjust c storage scheme)
+-> Re-examine bottlenecks, what's preventing full utilization of the hardware?
+
+
+What seemed to be preventing full hardware utilization is the tail effect. But when we get rid of the tail effect by forcing register reduction
+we see issues with local load/store patterns
+
+
+
+
+
+

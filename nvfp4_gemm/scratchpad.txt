@@ -1,0 +1,375 @@
+// "Simplify" the layout by combining modes that are possible to combine
+// Does not respect the shape of the layout, but does preserve total size
+// @post size(@a result) == size(@a layout)
+// @post depth(@a result) <= 1
+// @post for all i, 0 <= i < size(@a layout), @a layout(i) == @a result(i)
+template <class Shape, class Stride>
+CUTE_HOST_DEVICE constexpr
+auto
+coalesce(Layout<Shape,Stride> const& layout)
+{
+  auto flat_shape  = flatten(layout.shape());
+  auto flat_stride = flatten(layout.stride());
+
+  constexpr int R = decltype(rank(flat_shape))::value;
+  return detail::bw_coalesce<R-2>(flat_shape, flat_stride, get<R-1>(flat_shape), get<R-1>(flat_stride));
+}
+
+// @pre @a layout has been filtered (flattened and no stride-0 or size-1 modes).
+template <class Shape, class Stride, class CoTarget>
+CUTE_HOST_DEVICE constexpr
+auto
+complement(Shape const& shape, Stride const& stride, CoTarget const& cotarget)
+{
+  if constexpr (is_constant<0, Stride>::value) {
+    // Special case for irreducible rank-1 stride-0 layout
+    return make_layout(coalesce(cotarget));
+  } else {
+    // General case
+    constexpr int R = rank_v<Shape>;
+    static_assert(R == 1 || is_static<Stride>::value,
+                  "Dynamic-stride complement only for rank-1 layouts");
+
+    // Should just be a sort and a fold...
+    // Then we could even handle dynamic strides (but they would destroy all static strides)
+    auto [shape_, stride_, result_shape_, result_stride] =
+      fold(make_seq<R-1>{},
+           cute::make_tuple(shape, stride, cute::make_tuple(), cute::make_tuple(Int<1>{})),
+           [](auto const& init, auto i)
+           {
+              auto [shape, stride, result_shape, result_stride] = init;
+              auto min_stride = cute::min(stride);
+              auto min_idx    = cute::find(stride, min_stride);
+              auto new_shape  = min_stride / get<i>(result_stride);
+              auto new_stride = min_stride * get<min_idx>(shape);
+              static_assert(not is_constant<0, decltype(new_shape)>::value, "Non-injective Layout detected in complement.");
+
+              return cute::make_tuple(remove<min_idx>(shape),              // Remove the min_idx from shape
+                                      remove<min_idx>(stride),             // Remove the min_idx from stride
+                                      append(result_shape , new_shape ),   // new shape  = min_stride / last_stride
+                                      append(result_stride, new_stride));  // new stride = min_stride * curr_shape
+            });
+
+    // Append the last shape mode
+    auto new_shape    = get<0>(stride_) / get<R-1>(result_stride);         // new shape  = min_stride / last_stride
+    static_assert(not is_constant<0, decltype(new_shape)>::value, "Non-injective Layout detected in complement.");
+    auto result_shape = append(result_shape_, new_shape);
+
+    // Compute the rest_shape and rest_stride
+    auto new_stride  = get<0>(stride_) * get<0>(shape_);                   // new stride = min_stride * curr_shape
+    auto rest_shape  = coalesce(ceil_div(cotarget, new_stride));
+    auto rest_stride = compact_major<LayoutLeft>(rest_shape, new_stride);
+
+    // Coalesce and append (rest_shape, rest_stride)
+    return coalesce(make_layout(make_shape (result_shape , rest_shape ),
+                                make_stride(result_stride, rest_stride)));
+  }
+
+  CUTE_GCC_UNREACHABLE;
+}
+
+template <class LShape, class LStride,
+          class RShape, class RStride>
+CUTE_HOST_DEVICE constexpr
+auto
+composition(Layout<LShape,LStride> const& lhs,
+            Layout<RShape,RStride> const& rhs)
+{
+  auto flat_lhs = detail::coalesce_x(lhs, coprofile(rhs));
+  return detail::composition_impl(flat_lhs.shape(), flat_lhs.stride(), rhs.shape(), rhs.stride());
+}
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+template <class LShape, class LStride,
+          class TShape, class TStride>
+CUTE_HOST_DEVICE constexpr
+auto
+logical_divide(Layout<LShape,LStride> const& layout,
+               Layout<TShape,TStride> const& tiler)
+{
+  return composition(layout, make_layout(tiler, complement(tiler, shape(coalesce(layout)))));
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+auto cluster_layout_vmnk = tiled_divide(make_layout(cluster_shape), make_tile(typename TiledMma::AtomThrID{}));
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+typename Params::TMA_A tma_load_a = make_tma_atom_A_sm100<TmaInternalElementA>(
+        GmemTiledCopyA{},
+        tensor_a,
+        SmemLayoutA{}(_,_,_,cute::Int<0>{}),
+        TileShape{},
+        TiledMma{},
+        cluster_layout_vmnk);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// 1. Create your TiledMMA for NVFP4
+using MMA_Atom = SM100_MMA_MXF4_SS<
+    float_e2m1_t,      // NVFP4 data (4-bit)
+    float_e2m1_t,
+    float,             // F32 accumulator
+    float_ue4m3_t,     // E4M3 scale factors (8-bit)
+    128, 64,           // M=128, N=64
+    16>;               // VS=16
+
+using TiledMMA = decltype(make_tiled_mma(MMA_Atom{}));
+
+// 2. Define your tile shape
+using TileShape_MNK = Shape<_128, _64, _64>;  // Example: 128×64×64 tile
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
+using SmemLayoutAtomSFA = decltype(
+      Sm1xxBlkScaledConfig::deduce_smem_layoutSFA(TiledMMA{}, TileShape_MNK{}));
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+using SmemLayoutAtomPairA = SmemLayoutAtomPairA_;
+using SmemLayoutAtomPairB = SmemLayoutAtomPairB_;
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+using SmemLayoutAtomSFA = remove_cvref_t<decltype(get<1>(SmemLayoutAtomPairA{}))>;
+using SmemLayoutAtomSFB = remove_cvref_t<decltype(get<1>(SmemLayoutAtomPairB{}))>;
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+// SmemLayoutAtomSFA and SmemLayoutAtomSFB are for whole CTA tiles. We add the number of pipeline stages here.
+// The number of pipeline stages is the same as the number of pipeline stages from AB Load <-> MainLoop
+using SmemLayoutSFA = decltype(make_layout(
+  append(shape(SmemLayoutAtomSFA{}), Int<DispatchPolicy::Stages>{}),
+  append(stride(SmemLayoutAtomSFA{}), size(filter_zeros(SmemLayoutAtomSFA{})))
+));
+using SmemLayoutSFB = decltype(make_layout(
+  append(shape(SmemLayoutAtomSFB{}), Int<DispatchPolicy::Stages>{}),
+  append(stride(SmemLayoutAtomSFB{}), size(filter_zeros(SmemLayoutAtomSFB{})))
+));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+TiledMMA tiled_mma = make_tiled_mma(SM100_MMA_MXF4_SS<TypeA, TypeB, TypeAcc, TypeSF, M, N, VS, UMMA::Major::K, UMMA::Major::K>{});
+
+// Define MMA tiler sizes (static)
+auto bM = tile_size<0>(tiled_mma);             // MMA Tile M. We'll use 1 MMAs per MMA Tile M.
+auto bN = tile_size<1>(tiled_mma);             // MMA Tile N. We'll use 1 MMAs per MMA Tile M.
+auto bK = tile_size<2>(tiled_mma) * Int<4>{};  // MMA Tile K. We'll use 4 MMAs per MMA Tile K.
+auto mma_tiler = make_shape(bM, bN, bK);       // (MMA_M, MMA_N, MMA_K)
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+// Pre-partitioned Tile Shape (MmaTile_M, MmaTile_K) to post-partitioned (MmaA, NumMma_M, NumMma_K)
+auto mma_shape_A = partition_shape_A(tiled_mma, make_shape(size<0>(mma_tiler), size<2>(mma_tiler)));
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+auto sA_layout = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<TypeA>{}, mma_shape_A);
+
+
+using SMEMStorage = SharedStorage<TypeA, TypeB, decltype(sA_layout), decltype(sB_layout)>;
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------
+
+
+using TiledMma = TiledMma_; // <-- underscores are CollectiveMma template parameters
+using TileShape = TileShape_;
+using SmemLayoutAtomPairA = SmemLayoutAtomPairA_;
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+// Define A and B block shapes for reduced size TMA_LOADs
+using MmaShapeA_MK = decltype(partition_shape_A(TiledMma{}, make_shape(size<0>(TileShape{}), size<2>(TileShape{}))));
+
+using SmemLayoutAtomA   = remove_cvref_t<decltype(get<0>(SmemLayoutAtomPairA{}))>;
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+// Tile along K mode first before tiling over MN. PIPE mode last as usual.
+  // This maximizes TMA boxes due to better smem-K vectorization, reducing total issued TMAs.
+  // (MMA_TILE_M,MMA_TILE_K),MMA_M,MMA_K,PIPE)
+  using SmemLayoutA = decltype(UMMA::tile_to_mma_shape(
+      SmemLayoutAtomA{},
+      append(MmaShapeA_MK{}, Int<DispatchPolicy::Stages>{}),
+      cute::conditional_t<cutlass::gemm::detail::is_mn_major<StrideA>(), Step<_2,_1,_3>, Step<_1,_2,_3>>{}));
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+struct SharedStorage {
+    struct TensorStorage : cute::aligned_struct<128, _0> {
+      cute::ArrayEngine<SmemAllocTypeA, cute::cosize_v<SmemLayoutA>> smem_A;
+      cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
+      cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
+      cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
+    } tensors;
+
+    using PipelineStorage = typename MainloopPipeline::SharedStorage;
+    PipelineStorage pipeline;
+};
+
+
