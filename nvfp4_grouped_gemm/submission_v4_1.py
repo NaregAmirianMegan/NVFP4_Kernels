@@ -693,8 +693,11 @@ __global__ void nvfp4_group_gemm_kernel(__half** __restrict__ c_ref, CUtensorMap
     if (warp_id == 0) { tcgen05_dealloc_tmem<1>(tmem_addr_result, TD_MMA_N * 2); }
 }
 
+#define TIMING_DEBUG 0
+
 torch::Tensor nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>>& abc_tensors, torch::Tensor C_ptrs, torch::Tensor SFA_ptrs, torch::Tensor SFB_ptrs, torch::Tensor M_sizes, int N, int K, int G) {
 
+#if TIMING_DEBUG
     // Timing infrastructure
     cudaEvent_t start, after_device_alloc, after_h2d, after_kernel, after_dealloc;
     cudaEventCreate(&start);
@@ -704,6 +707,7 @@ torch::Tensor nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch
     cudaEventCreate(&after_dealloc);
 
     auto t_host_start = std::chrono::high_resolution_clock::now();
+#endif
 
     auto cuTensorMapEncodeTiled = get_cuTensorMapEncodeTiled();
 
@@ -721,15 +725,21 @@ torch::Tensor nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch
     constexpr CUtensorMapSwizzle SWIZZLE_TYPE = SWIZZLE ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE;
 
     // === HOST ALLOCATION ===
+#if TIMING_DEBUG
     auto t_host_alloc_start = std::chrono::high_resolution_clock::now();
+#endif
     CUtensorMap* tmaps = (CUtensorMap*) malloc(2 * G * sizeof(CUtensorMap));
     CUtensorMap* A_tmaps = tmaps;
     CUtensorMap* B_tmaps = tmaps + G;
     int* block_totals = (int*) malloc(G * sizeof(int));
+#if TIMING_DEBUG
     auto t_host_alloc_end = std::chrono::high_resolution_clock::now();
+#endif
 
     // === DEVICE ALLOCATION ===
+#if TIMING_DEBUG
     cudaEventRecord(start);
+#endif
     CUtensorMap* d_A_tmaps;
     CUtensorMap* d_B_tmaps;
     int* d_block_totals;
@@ -739,10 +749,14 @@ torch::Tensor nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch
 
     int* d_M_data;
     cudaMalloc(&d_M_data, G * sizeof(int));
+#if TIMING_DEBUG
     cudaEventRecord(after_device_alloc);
+#endif
 
     // === TMA MAP CREATION (CPU) ===
+#if TIMING_DEBUG
     auto t_tma_start = std::chrono::high_resolution_clock::now();
+#endif
     int* M_data = M_sizes.data_ptr<int>();
 
     int N_blocks = CEIL_DIV(N, N_TILE_SIZE);
@@ -751,6 +765,7 @@ torch::Tensor nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch
         tma_3d_map_ab<M_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled, &A_tmaps[i], reinterpret_cast<void*>(std::get<0>(abc_tensors[i]).data_ptr()), M_data[i], K);
         tma_3d_map_ab<N_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled, &B_tmaps[i], reinterpret_cast<void*>(std::get<1>(abc_tensors[i]).data_ptr()), N, K);
     }
+#if TIMING_DEBUG
     auto t_tma_end = std::chrono::high_resolution_clock::now();
 
     // === H2D COPIES ===
@@ -758,12 +773,15 @@ torch::Tensor nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch
     cudaEventCreate(&h2d_start);
     cudaEventSynchronize(after_device_alloc); // Ensure device alloc is done before H2D
     cudaEventRecord(h2d_start);
+#endif
     cudaMemcpy(d_A_tmaps, A_tmaps, G * sizeof(CUtensorMap), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B_tmaps, B_tmaps, G * sizeof(CUtensorMap), cudaMemcpyHostToDevice);
     cudaMemcpy(d_block_totals, block_totals, G * sizeof(int), cudaMemcpyHostToDevice);
 
     cudaMemcpy(d_M_data, M_data, G * sizeof(int), cudaMemcpyHostToDevice);
+#if TIMING_DEBUG
     cudaEventRecord(after_h2d);
+#endif
 
     // === KERNEL LAUNCH ===
     auto kernel_inst = nvfp4_group_gemm_kernel<M_TILE_SIZE, N_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_MMA_SIZE, SWIZZLE, PIPE_STAGES, NUM_WARPS>;
@@ -778,19 +796,25 @@ torch::Tensor nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch
     dim3 grid_dim(148*2);
     kernel_inst<<<grid_dim, threads>>>(reinterpret_cast<__half**>(C_ptrs.data_ptr()), d_A_tmaps, d_B_tmaps, reinterpret_cast<const uint8_t**>(SFA_ptrs.data_ptr()), reinterpret_cast<const uint8_t**>(SFB_ptrs.data_ptr()),
                                         d_M_data, N, K, d_block_totals, G);
+#if TIMING_DEBUG
     cudaEventRecord(after_kernel);
+
 
     // === DEALLOCATION ===
     cudaEventSynchronize(after_kernel); // Wait for kernel to finish before timing dealloc
+#endif
     cudaFree(d_A_tmaps);
     cudaFree(d_B_tmaps);
     cudaFree(d_block_totals);
     cudaFree(d_M_data);
+#if TIMING_DEBUG
     cudaEventRecord(after_dealloc);
 
     auto t_dealloc_start = std::chrono::high_resolution_clock::now();
+#endif
     free(tmaps);
     free(block_totals);
+#if TIMING_DEBUG
     auto t_dealloc_end = std::chrono::high_resolution_clock::now();
 
     // === PRINT TIMING RESULTS ===
@@ -826,7 +850,7 @@ torch::Tensor nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch
     cudaEventDestroy(after_h2d);
     cudaEventDestroy(after_kernel);
     cudaEventDestroy(after_dealloc);
-
+#endif
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         throw std::runtime_error(cudaGetErrorString(err));
@@ -880,17 +904,17 @@ def custom_kernel(data: input_t) -> output_t:
 
     # OPT: Is there a faster way to do this? -> Yes, we can make the H2D transfers asynchronous to overlap with host side data processing
     # Extract pointers and sizes
-    t_tensor_start = time.perf_counter()
+    # t_tensor_start = time.perf_counter()
     # A_ptrs = torch.tensor([a.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
     # B_ptrs = torch.tensor([b.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
     C_ptrs = torch.tensor([c.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cuda')
     SFA_ptrs = torch.tensor([sfa.data_ptr() for (sfa,sfb) in sfasfb_tensors_reordered], dtype=torch.uint64, device='cuda')
     SFB_ptrs = torch.tensor([sfb.data_ptr() for (sfa,sfb) in sfasfb_tensors_reordered], dtype=torch.uint64, device='cuda')
     M_sizes = torch.tensor([m for (m,n,k,_) in problem_sizes], dtype=torch.int32, device='cpu')
-    t_tensor_end = time.perf_counter()
+    # t_tensor_end = time.perf_counter()
 
-    tensor_creation_us = (t_tensor_end - t_tensor_start) * 1e6
-    print(f"Python tensor creation: {tensor_creation_us:9.1f} us")
+    # tensor_creation_us = (t_tensor_end - t_tensor_start) * 1e6
+    # print(f"Python tensor creation: {tensor_creation_us:9.1f} us")
 
     N = problem_sizes[0][1]
     K = problem_sizes[0][2]

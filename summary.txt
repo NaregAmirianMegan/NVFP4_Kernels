@@ -103,6 +103,8 @@ allowed a number of warmup runs so one time costs like JIT compilation and persi
 for the code and further details. 
 ---
 
+This kernel prepares the scale factor data using the `to_blocked` function, which reformats the scale factor matrices and vectors in a way that the PyTorch internal function _scaled_mm can ingest. In the GEMM kernel I discuss the formatting details of scale factors in much greater detail, but for further kernels in this section it's an unnecessarily convoluting detail that we will omit.
+
 The main issue with this kernel is that it prepares the data for each individual batch and then launches a new kernel. Kernel launches incur significant overhead if the
 work that kernel does completes on the order of 10s or 100s of microseconds. In these cases the kernel launch itself can makeup a non-trivial portion of the total runtime
 of the kernel. 
@@ -749,6 +751,8 @@ multiplication has low arithmetic intensity, which refers to how many compute op
 computations for which a single input value can participate, increases our arithmetic intensity. Thus a low arithmetic intensity means memory operations (which usually take longer than
 compute operations) will likely dominate the runtime in a perfectly optimized kernel. Realizing this earlier in the kernel development process could have allowed me to discover the
 type conversion operator in PTX earlier than I did.
+
+<Include placing of solution here>
 
 
 Useful Links:
@@ -1766,7 +1770,7 @@ In the dual GEMM operation the "*" sign refers to elementwise multiplication (Ha
 "m": 256, "n": 3072, "k": 4096, "l": 1
 "m": 512, "n": 3072, "k": 7168, "l": 1
 
-
+In this kernel all of the batch sizes are 1, so we don't need to worry about handling multiple batches. The A matrices are MxK and both of the B matrices are KxN.
 
 
 -- Kernel Iteration and Code Walkthroughs --
@@ -1774,14 +1778,66 @@ In the dual GEMM operation the "*" sign refers to elementwise multiplication (Ha
 Now let's iterate through the different kernels I developed and examine the failures and successes. Afterwards we will look at an algorithm I tried to implement, but I couldn't get it to work, and my suspicion is that hardware doesn't allow what I wanted to do algorithmically.
 
 
-- V0 -
+- V0 (submission_ref.py) -
 
 First lets look at the naive approach using PyTorch. 
 
+```
+    # Call torch._scaled_mm to compute the GEMV result
+    ref1 = torch.empty(
+        (l, m, n),
+        dtype=torch.float32,
+        device="cuda",
+    ).permute(1, 2, 0)
+    ref2 = torch.empty(
+        (l, m, n),
+        dtype=torch.float32,
+        device="cuda",
+    ).permute(1, 2, 0)
+    for l_idx in range(l):
+        # Convert the scale factor tensor to blocked format
+        scale_a = to_blocked(sfa_ref_cpu[:, :, l_idx])
+        scale_b1 = to_blocked(sfb1_ref_cpu[:, :, l_idx])
+        scale_b2 = to_blocked(sfb2_ref_cpu[:, :, l_idx])
+        # (m, k) @ (n, k).T -> (m, n)
+        res1 = torch._scaled_mm(
+            a_ref[:, :, l_idx],
+            b1_ref[:, :, l_idx].transpose(0, 1),
+            scale_a.cuda(),
+            scale_b1.cuda(),
+            bias=None,
+            out_dtype=torch.float32,
+        )
+        ref1[:, :, l_idx] = res1
 
-- V1 -
+        res2 = torch._scaled_mm(
+            a_ref[:, :, l_idx],
+            b2_ref[:, :, l_idx].transpose(0, 1),
+            scale_a.cuda(),
+            scale_b2.cuda(),
+            bias=None,
+            out_dtype=torch.float32,
+        )
+        ref2[:, :, l_idx] = res2
+    # Do silu on the first GEMM result and multiply with the second GEMM result
+    c_ref = (torch.nn.functional.silu(ref1) * ref2).to(torch.float16)
+    return c_ref
+```
 
-In this kernel we build our own kernel in PTX similar to later kernels in GEMV and the PTX GEMM kernel from the last section.
+This solution just uses normal block-scaled gemm to compute the dual gemm, performing two separate torch._scaled_mm calls and reducing the results in a third step. Although this code is very simple, it comes with a number of disadvantages we can optimize. First, by separating the operation into three separate calls into torch internals we are essentially issuing three kernel calls. This creates extra kernel launch overhead. Second, we can't re-use any of the data loaded from the A matrix into SMs on the GPU, resulting in a potentially very large amount of unnecessary memory traffic. On the same theme performing the reduction out of partial results stored in GMEM means much more traffic in and out of GMEM as well as a larger required GMEM footprint required by the operation. This kernel takes the first of two potential approaches to implementing the dual GEMM operation. We discuss these two approaches in detail in V1.
+
+The benchmark data for this baseline kernel is shown below:
+
+submission_ref.py
+{'m': 256, 'n': 4096 'k': 7168} -> Mean: 91.2us
+{'m': 512, 'n': 4096 'k': 7168} -> Mean: 95.3us
+{'m': 256, 'n': 3072 'k': 4096} -> Mean: 73.8us
+{'m': 512, 'n': 3072 'k': 7168} -> Mean: 87.5us
+
+
+- V1 (submission_ptx.py) -
+
+In this kernel we build our own kernel in PTX similar to later kernels in GEMV and the PTX GEMM kernel from the last section. If engineering simplicity and maintainability were a concern we would want to consider other options first such as using PyTorch native optimization options like torch.compile or Helion. However, since the goal is to reduce latency at all costs we jump straight to the paradigm offering the most granular control and thus potential for optimization.
 
 There are two key differences dual GEMM introduces on top of normal GEMM. First, we are multiplying the A matrix by two different B matrices. Second, we apply a function (or "activation" in ML terms) on the results of one of the matrix multiplications. When deciding how to design our initial kernel we really have two broad algorithmic options: keep the same paradigm that we had in GEMM where each CTA is responsible for a single block of GEMM output, or we could have each CTA compute a block of the final result after combining the result of the two GEMM operations it has computed.
 
@@ -1789,24 +1845,766 @@ The first approach would allow us to use our previous GEMM kernel pretty much di
 
 The second approach eliminates all of the aforementioned disadvantages in exchange for a few limitations we will discuss in a moment. In this approach each CTA is responsible for a final result output block (as opposed to just a block of output for a single GEMM). This means each CTA needs to perform two GEMM computations simultaneously and reduce those two results at the end of the kernel. The trade offs now become apparent: each CTA will take longer to run than the CTAs in the previous versions GEMM kernels because there is simply more work being done per CTA. Additionally, each CTA will compute smaller blocks of output in order to fit the results of two simultaneous MMAs in TMEM. These trade offs are well worth it because at the end of the day both kernels are performing the same work, so an increase in CTA runtime ultimately will never take longer than the linear path of doing the individual GEMMs and reducing the result in a separate kernel. Additionally, if we keep hardware utilizied well we shouldn't have to worry about computing smaller blocks of output since we are still utilizing the same (or more) of the hardware per unit time and structure of the waves launched on the GPU will be the same or very similar (i.e. number of CTAs in kernel will remain constant, this will be become clear as we dive deeper into the design of this kernel).
 
-Luckily implementing this second approach only requires a few simple modifications on top of the GEMM kernel from the last section.
+Luckily implementing this second approach only requires a few simple modifications on top of the GEMM kernel from the last section. First we need to duplicate everything we do with the B matrix in GEMM so we do each operation twice. In other words we load two B tiles for B1 and B2, and two scale factor B tiles for SFB1 and SFB2. Additionally, we perform two nvfp4 mma operations instead of just one (one for each of A @ B1 and A @ B2). The second modification is the application of the silu operation and the hadamard multiplication (element-wise multiplication) after the TMA/MMA loop has completed before storing back to GMEM.
+
+Taking a look at these modifications in code:
+
+Observe the duplicate load operations for B1 and B2.
+
+```
+    tcgen05_3dtma_g2s_ab<1>(a_smem_stage_ptr, &tmap_a, m_off, k_off_coremat, mbar_addr_tma_stage, CacheHintSm100::EVICT_LAST);
+    tcgen05_3dtma_g2s_ab<1>(b1_smem_stage_ptr, &tmap_b1, n_off, k_off_coremat, mbar_addr_tma_stage, CacheHintSm100::EVICT_FIRST);
+    tcgen05_3dtma_g2s_ab<1>(b2_smem_stage_ptr, &tmap_b2, n_off, k_off_coremat, mbar_addr_tma_stage, CacheHintSm100::EVICT_FIRST);
+    /*
+        Scale factors are stored in global memory in 4x4x32 chunks, i.e. 512B chunks where each chunk represents a
+        128x4 chunk of the SF matrix (in M or N xK)
+        So we calculate the offset in each dimension in terms of these 512B chunks:
+        k_off / 64 represents the number of 128x4 (512B) chunks along the K dimension which are contiguous (4 * SF_BLOCKS_SIZE = 64)
+        m/n_off / 128 represents the number of 512B chunks along the M dimension which are strided by K / 64 512B chunks
+    */
+    const uint8_t* sfa_g_ptr = sfa_gmem_base + ((k_off / 64) + (m_off / 128) * (K / 64)) * 512; // ISSUE: These could be just simple bit shifts, adjust if compiler doesn't
+    const uint8_t* sfb1_g_ptr = sfb1_gmem_base + ((k_off / 64) + (n_off / 128) * (K / 64)) * 512;
+    const uint8_t* sfb2_g_ptr = sfb2_gmem_base + ((k_off / 64) + (n_off / 128) * (K / 64)) * 512;
+    tcgen05_1dtma_g2s_sf(sfa_smem_stage_ptr, sfa_g_ptr, SFA_SMEM_TILESZ, mbar_addr_tma_stage, CacheHintSm100::EVICT_LAST);
+    tcgen05_1dtma_g2s_sf(sfb1_smem_stage_ptr, sfb1_g_ptr, SFB1_SMEM_TILESZ, mbar_addr_tma_stage, CacheHintSm100::EVICT_FIRST);
+    tcgen05_1dtma_g2s_sf(sfb2_smem_stage_ptr, sfb2_g_ptr, SFB2_SMEM_TILESZ, mbar_addr_tma_stage, CacheHintSm100::EVICT_FIRST);
+```
+
+We need to copy two sets of scale factors from SMEM to TMEM.
+
+```
+    // Load scale factors SMEM -> TMEM
+    for (int sub_k_iter = 0; sub_k_iter < TD_SMEM_K / TD_MMA_K; sub_k_iter++) {
+        uint64_t sfa_desc = make_smem_desc<0, false>(sfa_smem_stage_ptr + (sub_k_iter * 512)); // ISSUE: verify this should input 0 here
+        uint64_t sfb1_desc = make_smem_desc<0, false>(sfb1_smem_stage_ptr + (sub_k_iter * 512));
+        uint64_t sfb2_desc = make_smem_desc<0, false>(sfb2_smem_stage_ptr + (sub_k_iter * 512));
+        tcgen05_cp<1>(tmem_addr_sfa + 4 * sub_k_iter, sfa_desc);
+        tcgen05_cp<1>(tmem_addr_sfb1 + 4 * sub_k_iter, sfb1_desc);
+        tcgen05_cp<1>(tmem_addr_sfb2 + 4 * sub_k_iter, sfb2_desc);
+    }
+```
+
+Two MMA operations.
+
+```
+    tcgen05_mma_nvfp4<1>(tmem_addr_result_1, a_desc, b1_desc, make_instr_desc<TD_MMA_M, TD_MMA_N>(), sfa_tmem, sfb1_tmem, k_off + sub_k_iter);
+    tcgen05_mma_nvfp4<1>(tmem_addr_result_2, a_desc, b2_desc, make_instr_desc<TD_MMA_M, TD_MMA_N>(), sfa_tmem, sfb2_tmem, k_off + sub_k_iter);
+```
+
+Lastly we look at how to apply the silu and hadamard reduction operation to the two computed MMA tiles.
+
+```
+    mbar_wait(mbar_addr_epi, 0);
+    asm volatile("tcgen05.fence::after_thread_sync;");
+
+    // Load MMA into regs (TMEM -> Regs)
+    // Each warp loads 16 rows per tcgen05_ld and we have 128 rows, with 4 warps each one is responsible for 32 rows
+    // Each thread loads TD_MMA_N/2 values per result, meaning we need TD_MMA_N regs in total to load each result
+    float results_1[TD_MMA_N/2];
+    float results_2[TD_MMA_N/2];
+    int rows_per_warp = TD_MMA_M / (NUM_WARPS - 2);
+    for (int sub_m = 0; sub_m <  rows_per_warp / 16; sub_m++) {
+        if constexpr (TD_MMA_N == 128) {
+            tcgen05_ld<16, 256, 16>(results_1, tmem_addr_result_1 + (((warp_id * rows_per_warp) + sub_m * 16) << 16));
+            tcgen05_ld<16, 256, 16>(results_2, tmem_addr_result_2 + (((warp_id * rows_per_warp) + sub_m * 16) << 16));
+        }
+        else if constexpr (TD_MMA_N == 64) {
+            tcgen05_ld<16, 256, 8>(results_1, tmem_addr_result_1 + (((warp_id * rows_per_warp) + sub_m * 16) << 16));
+            tcgen05_ld<16, 256, 8>(results_2, tmem_addr_result_2 + (((warp_id * rows_per_warp) + sub_m * 16) << 16));
+        }
+        asm volatile("tcgen05.wait::ld.sync.aligned;");
+
+        // Post process and store from Regs to SMEM (Regs -> SMEM)
+        // Transfer result from SMEM -> GMEM (8 comes from 256/32 -> 256b per ld block from above)
+        float result[4];
+        for (int i = 0; i < TD_MMA_N / 8; i++) {
+            const int m_offset = m_off + warp_id * rows_per_warp + sub_m * 16 + lane_id / 4;
+            const int n_offset = n_off + i * 8 + (lane_id % 4) * 2;
+
+            result[0] = silu(results_1[i * 4]) * results_2[i * 4];
+            result[1] = silu(results_1[i * 4 + 1]) * results_2[i * 4 + 1];
+            result[2] = silu(results_1[i * 4 + 2]) * results_2[i * 4 + 2];
+            result[3] = silu(results_1[i * 4 + 3]) * results_2[i * 4 + 3];
+
+            reinterpret_cast<half2 *>(c_ref + (m_offset)*N + n_offset)[0] = __float22half2_rn({result[0], result[1]});
+            reinterpret_cast<half2 *>(c_ref + (m_offset + 8)*N + n_offset)[0] = __float22half2_rn({result[2], result[3]});
+        }
+    }
+```
+
+We declare two register buffers to hold the two separate MMA results: `results_1` and `results_2`. We then iteratively load each MMA result in chunks as we did in the GEMM kernel. Once each chunk has been loaded into their respective buffers we loop through those register buffers and do the following: apply the silu operation to the values in `results_1`, multiply that value by the positionally equivalent value in results_2, and store that end result as a FP16 value to GMEM.
 
 
+Below are the benchmark results of this new PTX kernel. We see a near 5x speed-up relative to the reference kernel! 
+
+submission_ptx.py
+{'m': 256, 'n': 4096 'k': 7168} -> Mean: 18.6us
+{'m': 512, 'n': 4096 'k': 7168} -> Mean: 18.6us
+{'m': 256, 'n': 3072 'k': 4096} -> Mean: 14.4us
+{'m': 512, 'n': 3072 'k': 7168} -> Mean: 18.5us
 
 
+- V2 (sub_ptx_v2.py) -
+
+One hardware feature that we have yet to take advantage of is "2SM" or "CTA_GROUP = 2". There isn't really a concise "name" for this hardware feature. The idea is to have 2 CTAs work together on a single tcgen05.mma instruction [see CTA_GROUP Details]. Ultimately what this does is allow CTAs to compute MMA operations without having all of the necessary data resident in their local SMEM. This reduces the amount of required SMEM per stage of the software pipeline, which in turn allows us to increase the depth of our software pipeline and/or the occupancy of each SM. 
+
+Up until now we have hardcoded CTA_GROUP to be 1. The changes to take advantage of CTA_GROUP = 2 are rather simple:
+
+In the kernel definition we need to include a `__cluster_dims__(CTA_GROUP, 1, 1)` directive so the GPU knows we are launching this kernel with the CTA grid broken down into (2, 1, 1) clusters [see Cluster Details]. Two CTAs can only communicate their data to eachother for the 2SM MMA if they are in the same cluster.
+
+```
+template<int TD_CTA_M, int TD_CTA_N,
+         int TD_SMEM_M, int TD_SMEM_N, int TD_SMEM_K, 
+         int TD_MMA_M, int TD_MMA_N, int TD_MMA_K, bool SWIZZLE, int PIPE_STAGES, int NUM_WARPS, int CTA_GROUP>
+__global__ void __cluster_dims__(CTA_GROUP, 1, 1) nvfp4_dual_gemm_kernel(__half* __restrict__ c_ref ...
+```
+
+Next if CTA_GROUP is 2 each CTA in the cluster only needs to load half of the data for the B1 and B2 matrices, hence why we divide by `CTA_GROUP`.
+
+```
+    constexpr int B1_SMEM_TILESZ = (TD_SMEM_N / CTA_GROUP) * (TD_SMEM_K / 2); // 4KB
+    constexpr int B2_SMEM_TILESZ = (TD_SMEM_N / CTA_GROUP) * (TD_SMEM_K / 2); // 4KB
+```
+
+We need to make sure all threads in the cluster are synchronized, so instead of just `__syncthreads()` we need to use a barrier whose scope is the entire cluster.
+
+```
+    else if constexpr (CTA_GROUP == 2) {
+        asm volatile("barrier.cluster.arrive.release.aligned;");
+        asm volatile("barrier.cluster.wait.acquire.aligned;"); // All threads in cluster wait until all have executed arrive instr.
+    }
+```
+
+All that remains is to pass `CTA_GROUP` which is 2 to all of the relevant PTX instructions we've previously discussed. In the case of TMA instructions it allows them to properly account for data arriving to both of the clusters. In the case of MMA instructions it instructs the hardware on where to find the missing half of data for B1 and B2. The Modular article I've mentioned has a great explanation of 2SM/CTA_GROUP = 2 as well [Modular article link].
 
 
+The previous kernel after implementing CTA_GROUP = 2 was the best I was able to develop in time to submit to the competition. However, after reviewing some of the submissions that performed better than mine I realized a key detail in the tcgen05.mma instruction that I had overlooked: the `collector_usage` field. The `collector_usage` field allows the user to specify whether or not data in the collector buffer is stale or can be used for future tcgen05.mma operations as well as what can be done with the data in the collector buffer. The collector buffer is essentially a data cache specific to the tcgen05.mma hardware. 
+
+There are four possible values for `collector_usage` with respect to the A matrix (there are also similar options for the B matrix, but we don't use those):
+
+1) .collector::a::fill -> Specifies that the A matrix read from the memory should be filled in collector buffer.
+2) .collector::a::use  -> Specifies that the A matrix can be read from the collector buffer. This requires a previous fill to the collector buffer to be still valid.
+3) .collector::a::lastuse -> Specifies that the A matrix can be read from the collector buffer and the contents of the collector buffer can be discarded. This requires a previous fill to the collector buffer to be valid till the collector buffer is read.
+4) .collector::a::discard -> Specifies that the contents of the collector buffer for A can be discarded.
+
+The default option for tcgen05.mma instructions is `.collector::a::discard`, meaning the contents of the collector buffer are immediately invalidated. However, if two tcgen05.mma operations re-use the same A matrix data we can keep that data resident in the A matrix collector buffer, allowing a decent speed-up by not having to load the data into the collector buffer from SMEM. The following code demonstrates this:
+
+```
+    tcgen05_mma_nvfp4<CTA_GROUP, COLLECTOR_USAGE::A_FILL>(tmem_addr_result_1, a_desc, b1_desc, make_instr_desc<TD_MMA_M*CTA_GROUP, TD_MMA_N>(), sfa_tmem, sfb1_tmem, k_off + sub_k_iter);
+    tcgen05_mma_nvfp4<CTA_GROUP, COLLECTOR_USAGE::A_LASTUSE>(tmem_addr_result_2, a_desc, b2_desc, make_instr_desc<TD_MMA_M*CTA_GROUP, TD_MMA_N>(), sfa_tmem, sfb2_tmem, k_off + sub_k_iter);
+```
+
+The first `tcgen05_mma_nvfp4` uses `.collector::a::fill` and the second uses `.collector::a::lastuse`. This combination means the first MMA fills the collector buffer while the second just reuses that data. It's worth noting that usage of the collector buffer is ultimately decided by hardware. Software can only provide what amount to "strong hints" as to how sequenced tcgen05.mma instructions can be optimized. With this optimization we see decent speed-ups on the first and third benchmarks, with the second and fourth staying about the same. The key difference seems to be the size of the m-dimension, but I haven't figured out why that dictates whether or not the problem shape benefits from the collector usgae speedup [Open Problem]. 
+
+sub_ptx_v2.py
+{'m': 256, 'n': 4096 'k': 7168} -> Mean: 14.4us
+{'m': 512, 'n': 4096 'k': 7168} -> Mean: 18.5us
+{'m': 256, 'n': 3072 'k': 4096} -> Mean: 10.3us
+{'m': 512, 'n': 3072 'k': 7168} -> Mean: 18.3us
+
+
+The following kernel iterations were experiments that didn't end up improving performance.
+
+
+- V3, Regression (sub_ptx_splitk_slow) -
+
+The k-dimension for these benchmark shapes are quite large relative to the M-dimension. A natural algorithm to consider for these kinds of problem shapes is split-k.
+
+We implemented split-k in the GEMV kernel; however, in that case the work along the k-dimension was split across threads in the same CTA, meaning the reduction of partial results could be done out of a workspace in SMEM before the final result is stored to GMEM. In this dual GEMM kernel the work would have to be split across separate CTAs (unless we figure out a way to use DSMEM, which will be discussed in V5) and thus the reduction of partial results needs to be done out of GMEM, and the reduction would require a separate kernel launch. Additionally, we need to allocate separate partial result storage buffers in GMEM, increasing the space in GMEM this kernel demands. 
+
+As we've discussed kernel launch overhead (and overhead in general) is more costly for smaller problem sizes because it is a larger portion of the overall runtime. Since these problem sizes are relatively small I suspected a split-k algorithm working out of GMEM and requiring a separate reduction kernel would likely result in performance loss rather than gain; however, I decided to implement it just to be sure.
+
+```
+    const int k_per_split = K / SPLIT_K;
+
+    CUtensorMap tmap_a, tmap_b1, tmap_b2, tmap_sfa, tmap_sfb1, tmap_sfb2;
+    constexpr CUtensorMapSwizzle SWIZZLE_TYPE = SWIZZLE ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE;
+    tma_3d_map_ab<M_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled, &tmap_a, a_ref.data_ptr(), M, K);
+    tma_3d_map_ab<N_TILE_SIZE/CTA_GROUP, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled, &tmap_b1, b1_ref.data_ptr(), N, K);
+    tma_3d_map_ab<N_TILE_SIZE/CTA_GROUP, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled, &tmap_b2, b2_ref.data_ptr(), N, K);
+
+    tma_3d_map_sf<K_TILE_SIZE>(cuTensorMapEncodeTiled, &tmap_sfa, sfa_ref.data_ptr(), M, K);
+    tma_3d_map_sf<K_TILE_SIZE>(cuTensorMapEncodeTiled, &tmap_sfb1, sfb1_ref.data_ptr(), N, K);
+    tma_3d_map_sf<K_TILE_SIZE>(cuTensorMapEncodeTiled, &tmap_sfb2, sfb2_ref.data_ptr(), N, K);
+
+    auto kernel_inst = nvfp4_dual_gemm_kernel<M_TILE_SIZE, N_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_MMA_SIZE, SWIZZLE, PIPE_STAGES, NUM_WARPS, CTA_GROUP>;
+
+    cudaFuncSetAttribute(kernel_inst, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+
+    constexpr int threads = WARP_SIZE * NUM_WARPS;
+    dim3 grid_dim(M / M_TILE_SIZE, N / N_TILE_SIZE, SPLIT_K);
+
+    kernel_inst<<<grid_dim, threads>>>(
+        reinterpret_cast<float*>(workspace_1.data_ptr()),
+        reinterpret_cast<float*>(workspace_2.data_ptr()),
+        M, N, K, k_per_split,
+        tmap_a, tmap_b1, tmap_b2, tmap_sfa, tmap_sfb1, tmap_sfb2);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+
+    // Reduction kernel: sum partials across splits and apply epilogue fusion
+    dim3 reduce_block(16, 16);
+    dim3 reduce_grid((M + 15) / 16, (N + 15) / 16);
+
+    splitk_reduce_kernel<<<reduce_grid, reduce_block>>>(
+        reinterpret_cast<float*>(workspace_1.data_ptr()),
+        reinterpret_cast<float*>(workspace_2.data_ptr()),
+        reinterpret_cast<__half*>(c_ref.data_ptr()),
+        M, N, SPLIT_K);
+```
+
+We define a divisor `SPLIT_K` to divide up the k-dimension. Each CTA then handles a `k_per_split` sized chunk along k, storing it in a temporary workspace: `workspace_1` for A @ B1 and `workspace_2` for A @ B2. Once the partial results have been computed and stored to the GMEM workspaces, a second kernel `splitk_reduce_kernel` is called to perform the silu, hadamard, and final GMEM result store.
+
+Nothing changes about the dual GEMM kernel except the k-loop only iterates through `k_per_split` elements instead of all of K, and the epilogue warp just stores the GEMM results to the respective workspaces instead of doing the silu/hadamard, which is done by the below reduction kernel:
+
+```
+// Split-K reduction kernel: sum partials and apply epilogue fusion
+__global__ void splitk_reduce_kernel(
+    const float* __restrict__ workspace_1,  // [SPLIT_K][M][N]
+    const float* __restrict__ workspace_2,  // [SPLIT_K][M][N]
+    __half* __restrict__ output,            // [M][N]
+    const int M, const int N, const int SPLIT_K
+) {
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m >= M || n >= N) return;
+
+    const int mn_stride = M * N;
+    const int base_idx = m * N + n;
+
+    // Sum partials across splits
+    float sum_1 = 0.0f, sum_2 = 0.0f;
+    for (int s = 0; s < SPLIT_K; s++) {
+        const int idx = s * mn_stride + base_idx;
+        sum_1 += workspace_1[idx];
+        sum_2 += workspace_2[idx];
+    }
+
+    // Apply epilogue fusion: silu(sum_1) * sum_2
+    float result = silu(sum_1) * sum_2;
+    output[base_idx] = __float2half(result);
+}
+```
+
+This kernel is very straightforward. Each thread is responsible for reducing a single final result, iterating across the split-k results, summing them, and performing the silu and multiplication on the results. Then it stores the result to the correct place in GMEM as an FP16.
+
+Below are the results for this split-k kernel using `SPLIT_K = 4`. As expected performance regresses significantly. We have added a large amount of GMEM traffic and kernel launch overhead, for a minor gain in parallelizing across the k-dimension. The performance gain by parallelizing split-k is small because we don't actually increase hardware utilization all that much for these problem shapes.
+
+sub_ptx_splitk_slow.py
+{'m': 256, 'n': 4096 'k': 7168} -> Mean: 45.2us
+{'m': 512, 'n': 4096 'k': 7168} -> Mean: 83.5us
+{'m': 256, 'n': 3072 'k': 4096} -> Mean: 41.0us
+{'m': 512, 'n': 3072 'k': 7168} -> Mean: 68.9us
+
+
+- V4 (sub_ptx_v2_cudalaunch) -
+
+In this kernel we just modify how the CUDA kernel actually gets launched. We use the `cudaLaunchKernelEx` API instead of the triple angle bracket notation. The kernel launch looks like the below:
+
+```
+    cudaLaunchConfig_t config = {0};
+    config.gridDim.x = M/M_TILE_SIZE;
+    config.gridDim.y = N/N_TILE_SIZE;
+    config.gridDim.z = 1;
+    config.blockDim.x = WARP_SIZE * NUM_WARPS;
+    config.blockDim.y = 1;
+    config.blockDim.z = 1;
+
+    // new attribute 
+    cudaLaunchAttribute attribute[1]; // only one attribute in this case
+    attribute[0].id = cudaLaunchAttributeClusterDimension; // specify attribute type
+    attribute[0].val.clusterDim.x = CTA_GROUP;
+    attribute[0].val.clusterDim.y = 1;
+    attribute[0].val.clusterDim.z = 1;
+
+    // add our attribute to the config
+    config.numAttrs = 1;
+    config.attrs = attribute;
+
+    cudaLaunchKernelEx(&config, kernel_inst, reinterpret_cast<__half*>(c_ref.data_ptr()), M, N, K, tmap_a, tmap_b1, tmap_b2, tmap_sfa, tmap_sfb1, tmap_sfb2); // launch our kernel with the config
+```
+
+The benchmark results are the same as the most optimal kernel as one might expect. We didn't change anything about the kernel itself, just the launch mechanism. 
+
+sub_ptx_v2_cudalaunch.py
+{'m': 256, 'n': 4096 'k': 7168} -> Mean: 14.4us
+{'m': 512, 'n': 4096 'k': 7168} -> Mean: 18.5us
+{'m': 256, 'n': 3072 'k': 4096} -> Mean: 10.3us
+{'m': 512, 'n': 3072 'k': 7168} -> Mean: 18.3us
+
+
+- V5, Regression (sub_ptx_v2_splitk, sub_ptx_v3) -
+
+I mentioned in the split-k implementation how one of the main slowdowns was the introduction of much more GMEM traffic and the overhead of an extra kernel launch. The Blackwell architecture does offer a potential way to minimize both of these slowdowns via DSMEM [DSMEM Details]. Instead of distributing the work along the k-dimension across independent CTAs, we distribute the work along CTAs in a single cluster and store the temporary results in DSMEM rather than GMEM. Once all partial results have been computed they get reduced cluster-locally in the same kernel and stored to GMEM. This avoids extra GMEM traffic and kernel launch overhead while still reaping the benefits of k-dimension parallelism. 
+
+sub_ptx_v2_splitk.py / sub_ptx_v3.py are my attempts at getting this algorithm to work in combination with 2SM; however, it's unclear to me if using both of these hardware features in this way is even allowed or intended by the hardware [Open Problem].
+
+The idea is to launch the grid as clusters of shape (CTA_GROUP, SPLIT_K, 1). When CTA_GROUP = 2 the cluster pairs work together to compute a 256xN chunk of the output for a K / SPLIT_K chunk along the k-dimension. The key would be that these partial results aren't stored exclusively in the SMEMs local to the CTA pair. Instead the results are split up into SPLIT_K chunks and each chunk is added to it's associated buffer in DSMEM of the cluster. So if we split the N dimension amongst the CTA pairs in the cluster for N = 256 and SPLIT_K = 4, each CTA pair would store a block of 256x64 in their local SMEMs. Once all CTAs in the cluster have finished computing and accumulating their results into the DSMEM buffers of all CTAs in the cluster, each CTA in the cluster can reduce their local chunk of results and store to GMEM.
+
+[Diagrams and better explanation here]
+
+-- Dual GEMM Summary --
+
+<Include table like for GEMV and final summary, including placing of solution>
 
 
 
 --- Group GEMM ---
 
+-- Group GEMM Operation --
 
--- Terms and Concepts (Glossary) --
+For Group GEMM we are given a set or "group" of GEMM operations that may have different shapes. The kernel must compute each of the GEMMs and store result to separate result buffers. Shown below are the benchmarks we will use to measure our kernel:
+
+{'g': 8, 'k': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168], 'm': [80, 176, 128, 72, 64, 248, 96, 160], 'n': [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]}
+{'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]}
+{'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]}
+{'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]}
+
+'g' gives us the number of individual GEMM problems to be computed. The following lists of length 'g' for 'm', 'n', and 'k' detail the problem shape for each GEMM. For each i in [0, g-1] the M, N, K of the GEMM is given by m[i], n[i], k[i], where the m, n, and k lists are taken from the dictionaries above. As input to the kernel we are also given lists of the addresses for the A, B, and C buffers for each of the GEMMs. That data is stored in host memory. 
+
+
+-- Kernel Iteration and Code Walkthroughs --
+
+Now let's iterate through the different kernels I developed and examine the failures and successes.
+
+
+- V0 (submission_v1.py) -
+
+As with the previous 3 kernels the baseline solution is to iterate through all of the GEMM problems and compute them one at a time with a separate kernel launch for each, as shown in the code below:
+
+```
+    result_tensors = []
+    for i, (
+        (a_ref, b_ref, c_ref),
+        (sfa_ref, sfb_ref),
+        (m, n, k, l),
+    ) in enumerate(
+        zip(
+            abc_tensors,
+            sfasfb_tensors,
+            problem_sizes,
+        )
+    ):
+        for l_idx in range(l):
+            # Convert the scale factor tensor to blocked format
+            scale_a = to_blocked(sfa_ref[:, :, l_idx])
+            scale_b = to_blocked(sfb_ref[:, :, l_idx])
+            # (m, k) @ (n, k).T -> (m, n)
+            res = torch._scaled_mm(
+                a_ref[:, :, l_idx].view(torch.float4_e2m1fn_x2),
+                b_ref[:, :, l_idx].transpose(0, 1).view(torch.float4_e2m1fn_x2),
+                scale_a.cuda(),
+                scale_b.cuda(),
+                bias=None,
+                out_dtype=torch.float16,
+            )
+            c_ref[:, :, l_idx] = res
+        result_tensors.append((c_ref))
+    return result_tensors
+```
+
+Again we encounter the same bottlenecks we saw in previous kernels using PyTorch's torch._scaled_mm. In this case we are serializing across the GEMM for each "group", so we aren't computing multiple GEMMs at the same time when the hardware could very well be capable of doing that. In this case our performance suffers far worse from this serialization and launching of multiple kernels because we are iterating over torch._scaled_mm many times rather than just once or twice like in previous kernels. This multiplies the impact by 'g'.
+
+Benchmark Results:
+
+{'g': 8, 'k': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168], 'm': [80, 176, 128, 72, 64, 248, 96, 160], 'n': [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]}  -> 47318.6us
+{'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]} -> 24315.7us
+{'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]} -> 5488.6us
+{'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]} -> 2805.5us
+
+
+- V1 (submission_v2.py) -
+
+Like in the dual GEMM kernel we convert to using our PTX GEMM implementation and build off of that. The initial problem we have to solve in this case is how to handle a bunch of different GEMMs within the same kernel launch. As we will see later on there are multiple approaches to solving the problem of passing multiple GEMMs to a kernel and mapping CTAs to the correct result blocks. In this first iteration we take the following and arguably simplest approach:
+
+Create a list of pointers and sizes, in this kernel we create a PyTorch tensor to pass to the inline C++ kernel wrapper (this is an inefficiency we will address in later kernels):
+
+```
+    A_ptrs = torch.tensor([a.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
+    B_ptrs = torch.tensor([b.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
+    C_ptrs = torch.tensor([c.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cuda')
+    SFA_ptrs = torch.tensor([sfa.data_ptr() for (sfa,sfb) in sfasfb_tensors_reordered], dtype=torch.uint64, device='cuda')
+    SFB_ptrs = torch.tensor([sfb.data_ptr() for (sfa,sfb) in sfasfb_tensors_reordered], dtype=torch.uint64, device='cuda')
+    M_sizes = torch.tensor([m for (m,n,k,_) in problem_sizes], dtype=torch.int32, device='cpu')
+    # OPT: uniform in benchmark, pass as constant?
+    N_sizes = torch.tensor([n for (m,n,k,_) in problem_sizes], dtype=torch.int32, device='cpu')
+    K_sizes = torch.tensor([k for (m,n,k,_) in problem_sizes], dtype=torch.int32, device='cpu')
+```
+
+We then use these metadata arrays to create lists of tensor maps and result tile counts to pass to the kernel.
+
+```
+    // Constants
+    constexpr int M_TILE_SIZE = 128;
+    constexpr int K_MMA_SIZE = 64;
+    constexpr int NUM_WARPS = 6;
+
+    // Configurables
+    constexpr int N_TILE_SIZE = 64;
+    constexpr int K_TILE_SIZE = 256;
+    constexpr bool SWIZZLE = true;
+    constexpr int PIPE_STAGES = 6;
+
+    constexpr CUtensorMapSwizzle SWIZZLE_TYPE = SWIZZLE ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE;
+
+    CUtensorMap* A_tmaps = (CUtensorMap*) malloc(G * sizeof(CUtensorMap));
+    CUtensorMap* B_tmaps = (CUtensorMap*) malloc(G * sizeof(CUtensorMap));
+    int* block_totals = (int*) malloc(G * sizeof(int));
+
+    // Allocate on device
+    CUtensorMap* d_A_tmaps;
+    CUtensorMap* d_B_tmaps;
+    int* d_block_totals;
+    cudaMalloc(&d_A_tmaps, G * sizeof(CUtensorMap));
+    cudaMalloc(&d_B_tmaps, G * sizeof(CUtensorMap));
+    cudaMalloc(&d_block_totals, G * sizeof(int));
+
+    int* d_M_data;
+    int* d_N_data;
+    int* d_K_data;
+    cudaMalloc(&d_M_data, G * sizeof(int));
+    cudaMalloc(&d_N_data, G * sizeof(int));
+    cudaMalloc(&d_K_data, G * sizeof(int));
+
+    uint64_t* A_ptrs_data = A_ptrs.data_ptr<uint64_t>();
+    uint64_t* B_ptrs_data = B_ptrs.data_ptr<uint64_t>();
+    int* M_data = M_sizes.data_ptr<int>();
+    int* N_data = N_sizes.data_ptr<int>();
+    int* K_data = K_sizes.data_ptr<int>();
+
+    for (int i = 0; i < G; ++i) {
+        block_totals[i] = CEIL_DIV(M_data[i], M_TILE_SIZE) * CEIL_DIV(N_data[i], N_TILE_SIZE) + (i > 0 ? block_totals[i-1] : 0);
+        tma_3d_map_ab<M_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled, &A_tmaps[i], reinterpret_cast<void*>(A_ptrs_data[i]), M_data[i], K_data[i]);
+        tma_3d_map_ab<N_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled, &B_tmaps[i], reinterpret_cast<void*>(B_ptrs_data[i]), N_data[i], K_data[i]);
+    }
+
+    // Copy to device
+    cudaMemcpy(d_A_tmaps, A_tmaps, G * sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B_tmaps, B_tmaps, G * sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_block_totals, block_totals, G * sizeof(int), cudaMemcpyHostToDevice);
+
+    cudaMemcpy(d_M_data, M_data, G * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_N_data, N_data, G * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K_data, K_data, G * sizeof(int), cudaMemcpyHostToDevice);
+
+    auto kernel_inst = nvfp4_group_gemm_kernel<M_TILE_SIZE, N_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_MMA_SIZE, SWIZZLE, PIPE_STAGES, NUM_WARPS>;
+
+    cudaFuncSetAttribute(
+        kernel_inst,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared  // Maximum shared memory
+    );
+
+    constexpr int threads = WARP_SIZE * NUM_WARPS;
+    dim3 grid_dim(block_totals[G-1]);
+    kernel_inst<<<grid_dim, threads>>>(reinterpret_cast<__half**>(C_ptrs.data_ptr()), d_A_tmaps, d_B_tmaps, reinterpret_cast<const uint8_t**>(SFA_ptrs.data_ptr()), reinterpret_cast<const uint8_t**>(SFB_ptrs.data_ptr()), d_M_data, d_N_data, d_K_data, d_block_totals, G);
+```
+
+Since we are going to use TMA to transfer data out of GMEM into our kernel we need to create tensor maps for all of the 'g' A and B matrices. As discussed in [TMA Details] tensor maps are an opaque structure, so we must rely on the CUDA driver API to create the structure on the host side. In otherwords we can't do anything clever by creating the tensor maps on device and parallelize that across different CTAs; however, we will see in later kernels how we can achieve a similar effect using certain Blackwell hardware features. For now we explicitly create and initialize all tmaps for A and B on the host side before launching the kernel. We malloc `A_tmaps` and `B_tmaps` as well as cudaMalloc'ing (which is just malloc for device memory) space to copy the tmaps to on device in `d_A_tmaps` and `d_B_tmaps`. 
+
+In addition to creating the A and B tmaps we also need to track how many result tiles there will be for each of the 'g' GEMMs. We do this by tracking a running sum for each GEMM via the `block_totals` array. `block_totals[i]` contains the total number of `M_TILE_SIZE` x `N_TILE_SIZE` blocks in GEMM[0] -> GEMM[i-1].
+
+Any data in host memory that the kernel needs on device and isn't passed via kernel parameters must be explicitly copied from host memory to device memory. There are a number of ways to do this, see [Host/Device Data Transfer Details] for a deeper dive into this topic. In this case we use `cudaMemcpy` which uses HBM (High Bandwidth Memory) to transfer data between host and device. We transfer the A and B tmaps as well as the `block_totals`.
+
+Each CTA will handle a single result tile so we launch as many CTAs as there are result tiles (`block_totals[G-1]` contains that total).
+
+Once inside the kernel the last remaining step differentiating this kernel from normal GEMM is having each CTA figure out which GEMM it's actually computing as well as the position of the result tile within that GEMM it's responsible for.
+
+```
+    int group = 0;
+    while (blockIdx.x >= block_totals[group]) group++;
+    const int group_idx = blockIdx.x - (group > 0 ? block_totals[group - 1] : 0);
+    const int n_tiles = CEIL_DIV(N_sizes[group], TD_CTA_N);
+    const int row_idx = group_idx / n_tiles;
+    const int col_idx = group_idx % n_tiles;
+    const int m_off = row_idx * TD_CTA_M;
+    const int n_off = col_idx * TD_CTA_N;
+```
+
+Each CTA's index (`blockIdx.x`) gets mapped onto the flattened array of result tiles, determining which GEMM and position within that GEMM this CTA is responsible for computing.
+
+<Insert Diagram demonstrating this mapping>
+
+The rest of the kernel is the same as our GEMM kernel.
+
+Benchmark Results:
+
+{'g': 8, 'k': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168], 'm': [80, 176, 128, 72, 64, 248, 96, 160], 'n': [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]}  -> 217.3us
+{'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]} -> 208.6us
+{'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]} -> 155.0us
+{'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]} -> 149.7us
+
+- V2 (submission_v3.py) -
+
+Before we start analyzing bottlenecks we can lay the foundation for an algorithmic improvement: non-persistent -> persistent kernel. In a non-persistent kernel we assign each CTA a fixed amount of work and divide the total work to be done by the kernel amongst each of the CTAs. This means many waves CTAs get launched on the GPU and there is no ability to explicitly overlap work from one wave of CTAs to the next. The name "non-persistent" refers to the fact that once a CTA has finished it's predetermined amount of work, it exits and is replaced by a different CTA performing the next set of work. In many cases a non-persistent kernel could be the correct approach; however, for group GEMM we could see substantial benefit from implementing a persistent kernel. A persistent kernel, as the name implies, has CTAs persist on the hardware across waves of work. Rather than completing one fixed portion of the output, a CTA can be responsible for multiple portions of the end result of the kernel.
+
+For example, let's say we are computing a group GEMM that has 148*2 = 296 total output tiles. Our Blackwell hardware has 148 SMs, and for the purposes of this example let's assume our kernel demands resources such that we can only launch 1 CTA per SM. In a non-persistent kernel we would launch 296 CTAs where each CTA computes 1 output tile. In a persistent kernel we would launch only 148 CTAs, and each CTA would compute 2 output tiles each. This particular kind of persistent kernel is called a "static" persistent kernel because we are statically defining how many output tiles each CTA will compute. There is a way to do persistent kernels "dynamically" which we will discuss in later iterations of this kernel.
+
+Persistent kernels can offer a number of benefits including data residency (pertinent data can stay resident in L1/SMEM across work tiles), reducing block deposit overhead, and potential cross tile pipeline overlap. In this kernel we mainly benefit from the latter two. Block depositing refers to the process of launching a CTA (or threadblock) onto a physical hardware unit (SM) when there are enough resources available. Cross tile pipeline overlap as demonstrated in the following diagram means we can overlap setup for the next work tile with the epilogue of the previous tile:
+
+<insert overlap diagram here>
+
+In this kernel we only implement the basic skeleton for a static persistent kernel. The major change is to wrap the TMA, MMA, and Epilogue warp sections in an outer work tile loop as shown:
+
+```
+    // Work-tile loop
+    for (int tile_idx = blockIdx.x; tile_idx < block_totals[G-1]; tile_idx += gridDim.x) {
+        // Grab correct data pointers, offsets, and TMA descriptors for this work tile
+        int group = 0;
+        while (tile_idx >= block_totals[group]) group++;
+        int group_idx = tile_idx - (group > 0 ? block_totals[group - 1] : 0);
+        int n_tiles = CEIL_DIV(N_sizes[group], TD_CTA_N);
+        int row_idx = group_idx / n_tiles;
+        int col_idx = group_idx % n_tiles;
+        int m_off = row_idx * TD_CTA_M;
+        int n_off = col_idx * TD_CTA_N;
+
+        const CUtensorMap* tmap_a = &A_tmaps[group];
+        const CUtensorMap* tmap_b = &B_tmaps[group];
+        const uint8_t* sfa_gmem_base = sfa_ptrs[group];
+        const uint8_t* sfb_gmem_base = sfb_ptrs[group];
+```
+
+Each CTA loops over all work tiles (also called output tiles) with a stride of `gridDim.x`, first computing the location of the work tile (as was done in the previous kernel during the setup phase) then proceeding with the normal GEMM algorithm. Notice how this is a new stage of work that can be included in the software pipeline and overlapped between tiles.
+
+The static persistent kernel does come with a drawback in that we are affining specific sets of work tiles to a sinlge CTA. If a CTA happens to complete work slower, and there are free CTAs/SMs that could be performing the remaining work, we lose out on some hardware utilization and parallelism because that work as been programmed to run sequentially on the slower CTA. In this barebones implementation of a static perisistent kernel we don't overlap the "compute next work tile" phase with other phases in the software pipeline, so our kernel performance suffers slightly compared to the dynamic kernel for the aforementioned reason.  
+
+Benchmark Results:
+
+{'g': 8, 'k': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168], 'm': [80, 176, 128, 72, 64, 248, 96, 160], 'n': [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]}  -> 215.6us
+{'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]} -> 214.1us
+{'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]} -> 167.8us
+{'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]} -> 162.9us
+
+
+- V3 (submission_persistent_kernel.py) -
+
+At this point in kernel development I decided to insert CUDA events and use timers to figure out the full timing breakdown of my kernel. In otherwords, how much time is spent on setup versus inside the actual kernel itself. You can view the debug and timing harnesses in the code itself. I discovered what should be rather intuitive for small problem shapes: we are spending a large portion of the total runtime on setup and teardown relative to the GPU kernel runtime. Setup and teardown includes allocation of necessary host and device buffers (via `malloc` and `cudaMalloc`) and teardown involves cleaning up allocated resources via `free` and `cudaFree` as well as device synchronization. 
+
+When designing a kernel it's also important to consider factors external to the kernel itself. In this case we note that the kernel (including setup and teardown) will be called many times in a row for benchmarking and correctness tests. It isn't necessary for us to perform the memory allocation / deallocation steps each time, since that memory can simply be re-used until the overall program exits. 
+
+KEY CHANGES from v3:
+1. PersistentBuffers struct holds all device/host buffers as static globals
+2. Buffers are only allocated when capacity is insufficient (first call or if G grows)
+3. Uses pinned host memory (cudaMallocHost) for faster H2D transfers
+4. cudaFree() from the hot path
+5. Driver function pointer is cached after first lookup
+
+Benchmark Results:
+
+{'g': 8, 'k': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168], 'm': [80, 176, 128, 72, 64, 248, 96, 160], 'n': [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]}  -> 162.1us
+{'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]} -> 158.3us
+{'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]} -> 118.6us
+{'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]} -> 116.3us
+
+
+- V4 (submission_v4.py) -
+
+This kernel is a separate branch off of submission_v3.py (V2). Instead of focusing on eliminating overhead from allocation / de-allocation, we are focus on reducing the amount of problem shape data we need to track and transfer. Notice in the benchmark problem shapes the values for N and K across groups is constant, so don't need to keep track of G different N and K values. Working with just one value for N and K reduces the amount of data we need to transfer through our kernel wrappers (it also reduces the number of temporary torch tensors we need to create). 
+
+The drawback here is we lose some generality. However, the structure of high performance GPU libraries is usually similar: for example a call to CUTLASS GEMM goes through many compile time and runtime decision trees before landing on a hyper specialized routine built to perform very well for that particular problem configuration. In the context of a general group GEMM kernel this "fixed N/K" kernel would called anytime N and K are invariant for a group GEMM call, otherwise a different kernel supporting variable N and/or K would be used. 
+
+We see significant improvement in this kernel over V2 (though not as much as V3 saw over V2).
+
+Benchmark Results:
+
+{'g': 8, 'k': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168], 'm': [80, 176, 128, 72, 64, 248, 96, 160], 'n': [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]}  -> 180.4us
+{'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]} -> 170.6us
+{'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]} -> 129.2us
+{'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]} -> 123.5us
+
+
+- V5 (submission_v4_1.py) -
+
+One additional potential bottleneck in the setup code is the creation of temporary pytorch tensors shown below:
+
+```
+A_ptrs = torch.tensor([a.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
+B_ptrs = torch.tensor([b.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
+C_ptrs = torch.tensor([c.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cuda')
+SFA_ptrs = torch.tensor([sfa.data_ptr() for (sfa,sfb) in sfasfb_tensors_reordered], dtype=torch.uint64, device='cuda')
+SFB_ptrs = torch.tensor([sfb.data_ptr() for (sfa,sfb) in sfasfb_tensors_reordered], dtype=torch.uint64, device='cuda')
+M_sizes = torch.tensor([m for (m,n,k,_) in problem_sizes], dtype=torch.int32, device='cpu')
+```
+
+In general creating objects in C++ can be very costly, especially for latency sensitive applications running on the order of microseconds. This is because most complex object creation (including pytorch tensor creation) involves heap allocations and some setup code. For that reason it's best to avoid creating objects unless you explicitly need to in order to achieve some functionality or acheive performance gains in a more impactful way. 
+
+In submission_v4_1.py we avoid the pytorch tensor creation by passing in a vector of tuples using the C++ standard library (which is very well optimized):
+
+```
+const std::vector<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>>& abc_tensors
+```
+
+This allows us to access the pointers to the A, B, and C matrices without first creating wrapper pytorch tensor objects. However, as you'll note from the benchmark results the performance doesn't really change. This invariant behavior stays consistent when I tested it with all of the future kernels we'll dive into, so it turns out that the cost benefit balance is equal for the two paradigms: creating pytorch tensors and passing them to the kernel, and creating standard library vectors out of python lists and passing it to the kernel. This was a surprise to me, and I'm still not 100% certain as to why this is the case, but here is my hypothesis:
+
+The first paradigm builds two small CPU tensors of raw uint64 pointers:
+A_ptrs = torch.tensor([a.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
+B_ptrs = torch.tensor([b.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
+These are 8×8 = 64 bytes each. The C++ extension receives them as plain torch::Tensor and calls .data_ptr<uint64_t>() — essentially just a pointer dereference.
+
+In the second, the raw Python list of tuples is passed directly:
+C++ signature: `nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>>& abc_tensors, ...)`
+
+Crossing the Python/C++ boundary this way forces pybind11 to:
+1. Iterate the Python list
+2. Unpack each Python tuple into 3 elements
+3. Type-check and convert each Python object to a torch::Tensor (refcount bump, metadata copy, type validation)
+4. Heap-allocate a `std::vector<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>>`
+
+Thus, in either case we end up creating temporary pytorch objects, either explicitly or through pybind11 (which is an API to interface python with C++ code).
+
+Benchmark Results:
+
+{'g': 8, 'k': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168], 'm': [80, 176, 128, 72, 64, 248, 96, 160], 'n': [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]}  -> 180.0us
+{'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]} -> 170.1us
+{'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]} -> 130.6us
+{'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]} -> 124.2us
+
+
+- V6 (submission_v4_2.py) -
+
+In light of the analysis done in the previous kernel, how we pass the data from Python to C++ doesn't really matter. Thus, for the sake of cleanliness we stick to using the standard library and pybind11 to pass the pointers to the C++ kernel wrapper. At this point we've consolidated to a single kernel launch, explored persistent kernels, and eliminated buffer allocation/de-allocation overheads. 
+
+Now we analyze the next bottleneck. The last remaining time consuming item in the setup code is the creation of the tensor maps. Each GEMM requires the creation of 2 or 3 tensor maps, so for G = 8 that's 12-24 tensor maps that need to be allocated on the host, initialized, and copied to device memory before launching the kernel. At this point in kernel development I didn't know how much time tensor map initalization took relative to the actual memory allocation. We will revisit that later, but for now we explore a hardware feature that allows us to prevent the setup overhead of tensor maps from scaling linearly with the number of groups.
+
+This feature is called `tensormap.replace`. 
+
+```
+tensormap.replace.mode.field1{.ss}.b1024.type  [addr], new_val;
+tensormap.replace.mode.field2{.ss}.b1024.type  [addr], ord, new_val;
+tensormap.replace.mode.field3{.ss}.b1024.type  [addr], new_val;
+
+.mode    = { .tile }
+.field1  = { .global_address, .rank }
+.field2  = { .box_dim, .global_dim, .global_stride, .element_stride  }
+.field3  = { .elemtype,  .interleave_layout, .swizzle_mode, .swizzle_atomicity, .fill_mode }
+.ss      = { .global, .shared::cta }
+.type    = { .b32, .b64 }
+```
+PTX Link: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-tensormap-replace
+
+The tensormap.replace instruction replaces the field, specified by .field qualifier, of the tensor-map object at the location specified by the address operand addr with a new value. The new value is specified by the argument new_val.
+
+This instruction allows for inidividual CTAs to modify a tensor map to target a specific segment of data from an arbitrary matrix. Since tensor maps are opaque structures and many attributes of the tensor maps will remain constant we still create template tensor maps on the host side. These host side templates are then distributed as grid constant parameters at kernel launch, and each CTA modifies the tensor map to load the appropriate data in parallel. 
+
+Using this approach we avoid the need to allocate memory for tensor maps on the host side and parallelize the tensor map creation process, preventing the kernel setup runtime from scaling linearly with the number of GEMM groups.
+
+The main drawback of using `tensormap.replace` in this way is device memory usage. Each CTA will need to manage and update it's own tensor maps, and tensor maps can only be used for TMA transfers if they reside in global memory. It's not possible to, for example, load and modify a tensor map in SMEM and use that SMEM tensor map for a TMA transfer. Thus we need to allocate room for 2 or 3 tensor maps for each CTA we are launching. In dynamic kernels this can be very expensive if you launch a large number of CTAs; however, with static persistent kernels the allocation overhead is greatly reduced (an unforseen advantage to static persistent kernels).
+
+Let's walk through the key pieces of code that implement the tensor map replace scheme.
+
+```
+tma_3d_map_ab<M_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled_fn, &tmap_a_temp, nullptr, M_TILE_SIZE, K);
+tma_3d_map_ab<N_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled_fn, &tmap_b_temp, nullptr, N, K);
+```
+
+First we create template tensor maps for A and B (if we use TMA for stores we would need and additional C matrix tensor map template). Notice we leave the address as null and give `M_TILE_SIZE` as a place holder value because that will also need to be changed depending on the group for which a CTA is computing a result tile.
+
+```
+cudaMalloc(&d_tmaps, 2 * NUM_CTAS * sizeof(CUtensorMap));
+```
+
+As mentioned we need space in GMEM for each CTA to store the modified tensor maps specific to that CTA.
+
+```
+// GMEM cache for CTA specific tensor maps
+CUtensorMap* g_A_tmap = d_tmaps + 2*blockIdx.x;
+CUtensorMap* g_B_tmap = g_A_tmap + 1;
+
+__shared__ CUtensorMap local_A_tmap; // ISSUE: Do these need to be aligned?
+__shared__ CUtensorMap local_B_tmap;
+
+if (warp_id == 0 && elect_one_sync()) {
+    local_A_tmap = tmap_a_temp;
+    local_B_tmap = tmap_b_temp;
+}
+```
+
+Inside the kernel itself we first find the pointers for this CTA to the modified tensor map storage in GMEM (`g_A_tmap` and `g_B_tmap`). Next we allocate spce in SMEM to store the tensor map templates for A and B. We will use these templates in SMEM to create the modified tensor maps for each work tile so we only need to load the template from GMEM once. We do that load with `local_A_tmap = tmap_a_temp;` and `local_B_tmap = tmap_b_temp;`.
+
+```
+bool update_group = (tile_idx >= next_group_start);
+```
+
+`update_group` is simply a bool that indicates whether the current work tile resides in a new GEMM group. If it does that means we need to update our tensor maps to properly reflect the addresses and shapes of the matrices.
+
+```
+if (update_group) {
+    sfa_gmem_base = groups[group].sfa_addr;
+    sfb_gmem_base = groups[group].sfb_addr;
+
+    if (elect_one_sync()) {
+        // Adjust M-dim value
+        asm volatile(
+            "tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], %1, %2;"
+            :
+            : "r"(local_A_tmap_addr), "n"(1), "r"(groups[group].M)
+        );
+
+        // Update base addresses
+        asm volatile(
+            "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;"
+            :
+            : "r"(local_A_tmap_addr), "l"(groups[group].A_addr)
+        );
+
+        asm volatile(
+            "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;"
+            :
+            : "r"(local_B_tmap_addr), "l"(groups[group].B_addr)
+        ); 
+    }
+
+    __syncwarp();
+
+    asm volatile(
+        "tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [%0], [%1], 128;"
+        :
+        : "l"(g_A_tmap), "r"(local_A_tmap_addr)
+    );
+    asm volatile(
+        "fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
+        :
+        : "l"(g_A_tmap)
+    );
+
+    asm volatile(
+        "tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [%0], [%1], 128;"
+        :
+        : "l"(g_B_tmap), "r"(local_B_tmap_addr)
+    );
+    asm volatile(
+        "fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
+        :
+        : "l"(g_B_tmap)
+    );
+}
+```
+
+Inside the TMA warp if we need to update the tensor map we perform three `tensormap.replace` operations: one to update matrix A's M dimension (since this varies across groups) and two to update the address of the A and B matrices. Only one thread in the TMA warp executes these instructions, but the warp should be synchronized for the next phase of the update. We issue three `tensormap.cp_fenceproxy` instructions 
+
+
+
+
+Benchmark Results:
+
+{'g': 8, 'k': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168], 'm': [80, 176, 128, 72, 64, 248, 96, 160], 'n': [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]}  -> 94.0us
+{'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]} -> 96.2us
+{'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]} -> 35.8us
+{'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]} ->  31.0us
+
+
+--- Terms and Concepts (Glossary) ---
 
 Table of Contents:
 
 (TODO: Include PTX code/instructions where appropriate)
+(TODO: Include descriptions for failed experiments in iteration folders for GEMV)
+(TODO: CLEAN UP CODE AND ADD COMMENTS TOO)
+(TODO: Clean up diagrams, <> brackets, "Open Problems", links)
 
 -> Coalesced Memory Access
 -> Memory Broadcasting
@@ -1826,7 +2624,7 @@ Table of Contents:
 -> Nsight Compute (discuss difficulty with tcgen05 and single thread launch with profiling)
 -> Latency Hiding and Software Pipelining
 -> Asynchronous Mechanisms Details
--> TMA Details (TMA, Descriptors, etc...)
+-> TMA Details (TMA, Descriptors (How they are opaque), etc...)
 -> Tensor Memory (TMEM)
 -> CTA_GROUP Details
 -> DSMEM Details
@@ -1834,8 +2632,21 @@ Table of Contents:
 -> Warp Specialization
 -> Cache Hint Details
 -> Data Layout (discuss re-arranged scale factor layouts, layouts of data in general)
+-> Host/Device Data Transfer Details (HBM, PCIE via "zero-copy" mapped)
+-> Device Memory Management
 
-(TODO: CLEAN UP CODE AND ADD COMMENTS TOO)
+
+--- Kernel Development Optimizations ---
+
+In this section I cover some procedural and engineering related learnings and improvements that will help me, and hopefully the reader as well, in any future kernel development endeavors. 
+
+-> Organization of different dev branches
+-> Organization of performance data
+-> Analyzing performance of tensor cores, especially tcgen05 (normal NCU numbers can be very misleading)
+-> Notes on using LLMs for kernel development
+
+
+
 
 SMEM->GMEM:
 

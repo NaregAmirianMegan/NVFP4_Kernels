@@ -6,7 +6,7 @@ from task import input_t, output_t
 from utils import make_match_reference
 
 """
-Try pre-computing tmaps
+TMA multi-cast
 """
 
 nvfp4_group_gemm_cuda_source = """
@@ -47,6 +47,16 @@ __device__ void inline tcgen05_commit(const int mbar_addr) {
     );
 }
 
+template<uint16_t CLUSTER_MASK>
+__device__ void inline tcgen05_commit_multicast(const int mbar_addr) {
+    asm volatile(
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
+        :
+        : "r"(mbar_addr), "h" (CLUSTER_MASK)
+        : "memory"
+    );
+}
+
 __device__ void mbar_wait(const int mbar_addr, const int phase) {
     uint32_t ticks = 0x989680;  // expiration date for try wait to re-try, from CUTLASS
     asm volatile(
@@ -68,6 +78,15 @@ __device__ inline void mbar_arrive_expect(const int mbar_addr, const int size) {
         "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
         :
         : "r"(mbar_addr), "r"(size) 
+        : "memory"
+    );
+}
+
+__device__ inline void mbar_arrive(const int mbar_addr, const int count) {
+    asm volatile(
+        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;"
+        :
+        : "r"(mbar_addr), "r"(count) 
         : "memory"
     );
 }
@@ -107,6 +126,15 @@ __device__ void inline tcgen05_3dtma_g2s_ab(int dst_smem, const void *tmap_ptr, 
         "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::%0.L2::cache_hint [%1], [%2, {%3, %4, %5}], [%6], %7;"
         :
         : "n"(CTA_GROUP), "r"(dst_smem), "l"(tmap_ptr), "r"(0), "r"(mn_off), "r"(k_off_coremat), "r"(mbar_addr), "l"(cache_policy)
+    );
+}
+
+template<int CTA_GROUP, uint16_t CLUSTER_MASK>
+__device__ void inline tcgen05_3dtma_g2s_ab_multicast(int dst_smem, const void *tmap_ptr, int mn_off, int k_off_coremat, int mbar_addr, CacheHintSm100 cache_policy) {
+    asm volatile (
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::%0.L2::cache_hint [%1], [%2, {%3, %4, %5}], [%6], %7, %8;"
+        :
+        : "n"(CTA_GROUP), "r"(dst_smem), "l"(tmap_ptr), "r"(0), "r"(mn_off), "r"(k_off_coremat), "r"(mbar_addr), "h"(CLUSTER_MASK), "l"(cache_policy)
     );
 }
 
@@ -205,6 +233,62 @@ struct tma_3d_map_ab<MN_SMEM_TD, K_SMEM_TD, CUtensorMapSwizzle::CU_TENSOR_MAP_SW
             elem_stride,                // const cuuint32_t *elementStrides,
             CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE, // Interleave patterns can be used to accelerate loading of values that are less than 4 bytes long.
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B, // Swizzling can be used to avoid shared memory bank conflicts.
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE, // L2 Promotion can be used to widen the effect of a cache-policy to a wider set of L2 cache lines.
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE // Any element that is outside of bounds will be set to zero by the TMA transfer.
+        );
+        // ISSUE: Insert error check here on res
+    }
+};
+// For 64B swizzle canonical layout of 128b segments is 8x4 (or core matrices of 8 rows x 128 element columns)
+template<int MN_SMEM_TD, int K_SMEM_TD>
+struct tma_3d_map_ab<MN_SMEM_TD, K_SMEM_TD, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B> {
+    static void init(PFN_cuTensorMapEncodeTiled_v12000 cuTensorMapEncodeTiled, CUtensorMap* tmap, void* ptr, uint64_t mn_dim_gmem, uint64_t k_dim_gmem) {
+        constexpr uint32_t rank = 3;
+        uint64_t dim_gmem[rank] = {128, mn_dim_gmem, k_dim_gmem/128};
+        uint64_t stride_gmem[rank - 1] = {k_dim_gmem/2, 64};
+        uint32_t dim_smem[rank] = {128, MN_SMEM_TD, K_SMEM_TD/128};
+        uint32_t elem_stride[rank] = {1, 1, 1};
+
+        // Create the tensor descriptor.
+        auto res = cuTensorMapEncodeTiled(
+            tmap,                // CUtensorMap *tensorMap,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+            rank,                       // cuuint32_t tensorRank,
+            ptr,                 // void *globalAddress,
+            dim_gmem,                       // const cuuint64_t *globalDim,
+            stride_gmem,                     // const cuuint64_t *globalStrides,
+            dim_smem,                   // const cuuint32_t *boxDim,
+            elem_stride,                // const cuuint32_t *elementStrides,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE, // Interleave patterns can be used to accelerate loading of values that are less than 4 bytes long.
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B, // Swizzling can be used to avoid shared memory bank conflicts.
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE, // L2 Promotion can be used to widen the effect of a cache-policy to a wider set of L2 cache lines.
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE // Any element that is outside of bounds will be set to zero by the TMA transfer.
+        );
+        // ISSUE: Insert error check here on res
+    }
+};
+// For 32B swizzle canonical layout of 128b segments is 8x2 (or core matrices of 8 rows x 64 element columns)
+template<int MN_SMEM_TD, int K_SMEM_TD>
+struct tma_3d_map_ab<MN_SMEM_TD, K_SMEM_TD, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B> {
+    static void init(PFN_cuTensorMapEncodeTiled_v12000 cuTensorMapEncodeTiled, CUtensorMap* tmap, void* ptr, uint64_t mn_dim_gmem, uint64_t k_dim_gmem) {
+        constexpr uint32_t rank = 3;
+        uint64_t dim_gmem[rank] = {64, mn_dim_gmem, k_dim_gmem/64};
+        uint64_t stride_gmem[rank - 1] = {k_dim_gmem/2, 32};
+        uint32_t dim_smem[rank] = {64, MN_SMEM_TD, K_SMEM_TD/64};
+        uint32_t elem_stride[rank] = {1, 1, 1};
+
+        // Create the tensor descriptor.
+        auto res = cuTensorMapEncodeTiled(
+            tmap,                // CUtensorMap *tensorMap,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+            rank,                       // cuuint32_t tensorRank,
+            ptr,                 // void *globalAddress,
+            dim_gmem,                       // const cuuint64_t *globalDim,
+            stride_gmem,                     // const cuuint64_t *globalStrides,
+            dim_smem,                   // const cuuint32_t *boxDim,
+            elem_stride,                // const cuuint32_t *elementStrides,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE, // Interleave patterns can be used to accelerate loading of values that are less than 4 bytes long.
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B, // Swizzling can be used to avoid shared memory bank conflicts.
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE, // L2 Promotion can be used to widen the effect of a cache-policy to a wider set of L2 cache lines.
             CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE // Any element that is outside of bounds will be set to zero by the TMA transfer.
         );
@@ -433,11 +517,15 @@ __device__ uint32_t constexpr make_instr_desc() {
 }
 
 // Complete descriptor with address info
-template<int MN_DIM, bool SWIZZLE_128B = false>
+template<int MN_DIM, CUtensorMapSwizzle SWIZZLE_TYPE = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE>
 __device__ uint64_t inline make_smem_desc(int smem_addr) {
-    constexpr uint64_t LBO = SWIZZLE_128B ? 1 : MN_DIM*16;
-    constexpr uint64_t SBO = SWIZZLE_128B ? 8 * 128 : 8 * 16;
-    constexpr uint64_t SWIZZLE_BITS = SWIZZLE_128B ? 2 : 0;
+    constexpr uint64_t LBO = SWIZZLE_TYPE != CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE ? 1 : MN_DIM*16;
+    constexpr uint64_t SBO = SWIZZLE_TYPE == CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B ? 8 * 128 : 
+                                (SWIZZLE_TYPE == CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B ? 8 * 64 : 
+                                    (SWIZZLE_TYPE == CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B ? 8 * 32 : 8 * 16));
+    constexpr uint64_t SWIZZLE_BITS = SWIZZLE_TYPE == CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B ? 2 : 
+                                (SWIZZLE_TYPE == CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B ? 4 : 
+                                    (SWIZZLE_TYPE == CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B ? 6 : 0));
     return encode(smem_addr) | (encode(LBO) << 16) | (encode(SBO) << 32) | (0x1ULL << 46) | (SWIZZLE_BITS << 61);
 }
 
@@ -496,6 +584,98 @@ __device__ inline int clc_check_steal(const int clc_result_addr) {
     return res;
 }
 
+__device__ inline void tmap_update_addr(const int local_tmap_addr, const void* new_addr) {
+    // Update base addresses
+    asm volatile(
+        "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;"
+        :
+        : "r"(local_tmap_addr), "l"(new_addr)
+    );
+}
+
+template<int DIM>
+__device__ inline void tmap_update_dim(const int local_tmap_addr, const int new_dim) {
+    // Adjust DIM value
+    asm volatile(
+        "tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], %1, %2;"
+        :
+        : "r"(local_tmap_addr), "n"(DIM), "r"(new_dim)
+    );
+}
+
+template<int DIM = 1>
+__device__ inline void tmap_update_stride(const int local_tmap_addr, const uint64_t new_stride) {
+    // Adjust stride
+    asm volatile(
+        "tensormap.replace.tile.global_stride.shared::cta.b1024.b64 [%0], %1, %2;"
+        :
+        : "r"(local_tmap_addr), "n"(DIM), "l"(new_stride)
+    );
+}
+
+__device__ inline void tmap_update(const int local_tmap_addr, const void* new_addr) {
+    // Update base addresses
+    asm volatile(
+        "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;"
+        :
+        : "r"(local_tmap_addr), "l"(new_addr)
+    );
+}
+
+template<int DIM = 1>
+__device__ inline void tmap_update(const int local_tmap_addr, const void* new_addr, const int new_dim) {
+    // Adjust M-dim value
+    asm volatile(
+        "tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], %1, %2;"
+        :
+        : "r"(local_tmap_addr), "n"(DIM), "r"(new_dim)
+    );
+
+    // Update base addresses
+    asm volatile(
+        "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;"
+        :
+        : "r"(local_tmap_addr), "l"(new_addr)
+    );
+}
+
+template<int DIM = 1>
+__device__ inline void tmap_update(const int local_tmap_addr, const void* new_addr, const int new_dim, const uint64_t new_stride) {
+    // Adjust M-dim value
+    asm volatile(
+        "tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], %1, %2;"
+        :
+        : "r"(local_tmap_addr), "n"(DIM), "r"(new_dim)
+    );
+
+    // Adjust stride
+    asm volatile(
+        "tensormap.replace.tile.global_stride.shared::cta.b1024.b64 [%0], %1, %2;"
+        :
+        : "r"(local_tmap_addr), "n"(0), "l"(new_stride)
+    );
+
+    // Update base addresses
+    asm volatile(
+        "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;"
+        :
+        : "r"(local_tmap_addr), "l"(new_addr)
+    );
+}
+
+__device__ inline void tmap_fence_proxy(const CUtensorMap* g_tmap, const int local_tmap_addr) {
+    asm volatile(
+        "tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [%0], [%1], 128;"
+        :
+        : "l"(g_tmap), "r"(local_tmap_addr)
+    );
+    asm volatile(
+        "fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
+        :
+        : "l"(g_tmap)
+    );
+}
+
 template<int A, int B>
 int constexpr MAX() {
     if (A < B) 
@@ -504,13 +684,21 @@ int constexpr MAX() {
 }
 
 struct GroupDesc {
-    void* A_addr;
-    void* B_addr;
-    __half* C_addr;
+    CUtensorMap tmap_a;
+    CUtensorMap tmap_b;
+    CUtensorMap tmap_c;
     uint8_t* sfa_addr;
     uint8_t* sfb_addr;
     int M;
+    int N;
+    int K;
     int block_start;
+};
+
+constexpr int MAX_G = 8;
+
+struct GroupDescs {
+    GroupDesc groups[MAX_G];
 };
 
 constexpr int WARP_SIZE = 32;
@@ -531,24 +719,26 @@ constexpr int SF_BLOCK_SIZE = 16;
 */
 template<int TD_CTA_M, int TD_CTA_N,
          int TD_SMEM_M, int TD_SMEM_N, int TD_SMEM_K, 
-         int TD_MMA_M, int TD_MMA_N, int TD_MMA_K, bool SWIZZLE, int PIPE_STAGES, int NUM_WARPS, int OUT_N_CHUNK>
-__global__ void __cluster_dims__(1, 1, 1) nvfp4_group_gemm_kernel(GroupDesc* groups, CUtensorMap* a_tmaps, CUtensorMap* b_tmaps, 
-                                                                    CUtensorMap* c_tmaps, const int total_tiles, const int N, 
-                                                                    const int K, const int G) {
-    /*
-        ISSUE: Static assert that TD_SMEM_X are multiples of TD_MMA_X (for all X in {M, N, K})
-               Likewise we should assert that TD_CTA_X are multiples of TD_SMEM_X (for all X in {M, N})
-        We should also assert that all M, N, K dimensions are multiples of TD_CTA_M/N and TD_SMEM_K
-    */
+         int TD_MMA_M, int TD_MMA_N, int TD_MMA_K, CUtensorMapSwizzle SWIZZLE_TYPE, 
+         int PIPE_STAGES, int NUM_WARPS, int OUT_N_CHUNK, int TILE_DESC_PIPE_STAGES,
+         int CLUSTER_SIZE, bool SINGLE_WAVE, bool NK_VAR>
+__global__ void __launch_bounds__(WARP_SIZE * NUM_WARPS) __cluster_dims__(CLUSTER_SIZE, 1, 1) nvfp4_group_gemm_kernel(const __grid_constant__ GroupDescs group_descs, const int total_tiles, int N, int K, const int G) {
+    const GroupDesc* groups = group_descs.groups;
 
     // Statically computed values
-    constexpr int WIDTH_COREMAT = SWIZZLE ? 256 : 32;
+    constexpr int WIDTH_COREMAT = SWIZZLE_TYPE == CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B ? 256 : 
+                                    (SWIZZLE_TYPE == CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B ? 128 : 
+                                        (SWIZZLE_TYPE == CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B ? 64 : 32));
+
     constexpr int SF_SMEM_TILESZ = 128 * (TD_SMEM_K / SF_BLOCK_SIZE);
     constexpr int A_SMEM_TILESZ = TD_SMEM_M * (TD_SMEM_K / 2);
     constexpr int B_SMEM_TILESZ = TD_SMEM_N * (TD_SMEM_K / 2);
     constexpr int SMEM_TILE_SZ = A_SMEM_TILESZ + B_SMEM_TILESZ + SF_SMEM_TILESZ + (1 + TD_MMA_N/256)*SF_SMEM_TILESZ;
 
     constexpr int C_CHUNK_SMEM_TILESZ = TD_SMEM_M * OUT_N_CHUNK; // Size of chunk used for double buffer
+    //constexpr int C_SMEM_TILESZ = TD_SMEM_M * TD_SMEM_N;
+
+    constexpr uint16_t CLUSTER_MASK = ((uint16_t)1 << CLUSTER_SIZE) - 1; // Set first CLUSTER_SIZE bits to 1
 
     // Calculate constants, offsets, etc... for this thread/warp
     const int warp_id = threadIdx.x / WARP_SIZE;
@@ -574,6 +764,9 @@ __global__ void __cluster_dims__(1, 1, 1) nvfp4_group_gemm_kernel(GroupDesc* gro
     const int sfb_smem_ptr = static_cast<int>(__cvta_generic_to_shared(sfb_smem));
     const int c_smem_ptr = static_cast<int>(__cvta_generic_to_shared(c_smem));
 
+    __shared__ int m_off_arr[TILE_DESC_PIPE_STAGES];
+    __shared__ int n_off_arr[TILE_DESC_PIPE_STAGES];
+
     // Allocate TMEM buffers, single warp execution ISSUE: IMPLEMENT TWO ALLOC TECHNIQUE WITH ONE FOR RESULT ONE FOR SF TILES (THERE ARE TRADEOFFS WITH ALLOCATION SPACE VS NUM ALLOCATIONS, COULD BE A PROB SIZE SPECIFIC THING)
     /*
         We need TD_MMA_N columns for the result (using FP32 accumulation)
@@ -586,111 +779,112 @@ __global__ void __cluster_dims__(1, 1, 1) nvfp4_group_gemm_kernel(GroupDesc* gro
     */
     __shared__ int tmem_addr_ptr[1];
 
-    int clc_phase = 0;
-    __shared__ uint4 clc_result; // result for CLC cancel requests
-    int clc_result_addr = static_cast<int>(__cvta_generic_to_shared(&clc_result));
-
     // Setup memory barriers
-    __shared__ alignas(8) int64_t mbars[PIPE_STAGES * 2 + 2];
+    __shared__ alignas(8) int64_t mbars[PIPE_STAGES * 2 + 6 + TILE_DESC_PIPE_STAGES];
     const int mbar_addr_tma = static_cast<int>(__cvta_generic_to_shared(mbars));
     const int mbar_addr_mma = mbar_addr_tma + PIPE_STAGES * 8; // 8 because each mbar is 64bits = 8B
     const int mbar_addr_epi = mbar_addr_mma + PIPE_STAGES * 8;
-    const int mbar_addr_clc = mbar_addr_epi + 8;
+    const int mbar_addr_epi_done = mbar_addr_epi + 3 * 8;
+    const int mbar_addr_tile_ready = mbar_addr_epi_done + 3 * 8;
+
+    int epi_phase[3] = {0, 0, 0};
+    int epi_done_phase[3] = {0, 0, 0};
+    int tile_ready_phase[TILE_DESC_PIPE_STAGES] = {};
+
+    int tmem_buf = 0;
 
     if (warp_id == 0 && elect_one_sync()) {
-        for (int i = 0; i < PIPE_STAGES * 2 + 2; i++) {
-            mbar_init(mbar_addr_tma + i * 8, 1);
+        for (int i = 0; i < PIPE_STAGES * 2 + 6 + TILE_DESC_PIPE_STAGES; i++) {
+            mbar_init(mbar_addr_tma + i * 8, (i >= PIPE_STAGES && i < 2 * PIPE_STAGES) ? CLUSTER_SIZE : 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;"); // ISSUE: Verify we need this here
     } else if (warp_id == 1) { 
-        tcgen05_alloc_tmem<1>(tmem_addr_ptr, TD_MMA_N*2); 
+        tcgen05_alloc_tmem<1>(tmem_addr_ptr, 512); 
     }
     __syncthreads(); // Ensure all threads have correct TMEM ptrs
 
-    const int tmem_addr_result = tmem_addr_ptr[0];
-    const int tmem_addr_sfa = tmem_addr_result + TD_MMA_N;
-    const int tmem_addr_sfb = tmem_addr_sfa + (TD_MMA_M/32) * (TD_SMEM_K/64);
+    const int tmem_addr_base = tmem_addr_ptr[0];
+    const int tmem_result_ptrs[3] = {tmem_addr_base, tmem_addr_base + TD_MMA_N, tmem_addr_base + 2*TD_MMA_N};
+    const int tmem_sfa_ptrs[3] = {tmem_result_ptrs[2] + TD_MMA_N, tmem_result_ptrs[2] + TD_MMA_N + 16, tmem_result_ptrs[2] + TD_MMA_N + 32};
+    const int tmem_sfb_ptrs[3] = {tmem_sfa_ptrs[2] + 16, tmem_sfa_ptrs[2] + 32, tmem_sfa_ptrs[2] + 48};
 
+    constexpr int TILE_WARP = NUM_WARPS - 3;
     constexpr int TMA_WARP = NUM_WARPS - 2;
     constexpr int MMA_WARP = NUM_WARPS - 1;
     
-    // ISSUE: No need for M, N tile loops since TD_CTA_X == TD_SMEM_X
-
     // Work-tile loop
-    const int n_tiles = CEIL_DIV(N, TD_CTA_N);
-    int last_group = -1;
-    uint8_t* sfa_gmem_base;
-    uint8_t* sfb_gmem_base;
-    CUtensorMap* tmap_a;
-    CUtensorMap* tmap_b;
-    CUtensorMap* tmap_c;
+    int n_tiles = CEIL_DIV(N, TD_CTA_N);
 
-    int tile_idx = blockIdx.x;
-#if DEBUG
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("Block 0: Starting iteration, tile_idx=%d\\n", tile_idx);
-    }
-#endif
-    while (true) {
-        // Async cancellation request
-        asm volatile("fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster;");
-        if (warp_id == 0 && elect_one_sync()) {
-            asm volatile(
-                "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 [%0], [%1];"
-                :
-                : "r"(clc_result_addr), "r"(mbar_addr_clc)
-            );
-            mbar_arrive_expect(mbar_addr_clc, sizeof(uint4));
-        }
-#if DEBUG
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            printf("Block 0: Issued try_cancel\\n");
-        }
-#endif
+    __shared__ int M_vals[TILE_DESC_PIPE_STAGES];
+    __shared__ int group_vals[TILE_DESC_PIPE_STAGES];
+    __shared__ int N_vals[NK_VAR ? TILE_DESC_PIPE_STAGES : 1];
+    __shared__ int K_vals[NK_VAR ? TILE_DESC_PIPE_STAGES : 1];
 
-        int group, lo = 0, hi = G - 1;
-        while (lo <= hi) {
-            group = lo + ((hi - lo) / 2);
-            if (tile_idx < groups[group].block_start) {
-                hi = group - 1; // search left
-            } else if (group < G - 1 && tile_idx >= groups[group + 1].block_start) {
-                lo = group + 1; // search right
-            } else {
-                break; // found group of tile_idx;
+    int glob_k_off = 0;
+    int tile_stages = 0;
+
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+    const bool is_leader = (cta_rank == 0);
+
+    bool primed = false;
+
+    for (int tile_idx = blockIdx.x; tile_idx < total_tiles; tile_idx += gridDim.x) {
+        int tile_stage = tile_stages % TILE_DESC_PIPE_STAGES;
+
+        if (warp_id == TILE_WARP) {
+            // ISSUE: if stages wrap around we need another set of barriers to ensure consumers have consumed
+
+            int group, lo = 0, hi = G - 1;
+            while (lo <= hi) {
+                group = lo + ((hi - lo) / 2);
+                if (tile_idx < groups[group].block_start) {
+                    hi = group - 1; // search left
+                } else if (group < G - 1 && tile_idx >= groups[group + 1].block_start) {
+                    lo = group + 1; // search right
+                } else {
+                    break; // found group of tile_idx;
+                }
+            }
+
+            M_vals[tile_stage] = groups[group].M;
+            group_vals[tile_stage] = group;
+
+            if constexpr (NK_VAR) {
+                N_vals[tile_stage] = groups[group].N;
+                K_vals[tile_stage] = groups[group].K;
+            }
+
+            int group_tile = tile_idx - groups[group].block_start;
+            if constexpr (NK_VAR) {
+                n_tiles = CEIL_DIV(groups[group].N, TD_CTA_N);
+            }
+            int row_idx = group_tile / n_tiles;
+            int col_idx = group_tile % n_tiles;
+            m_off_arr[tile_stage] = row_idx * TD_CTA_M;
+            n_off_arr[tile_stage] = col_idx * TD_CTA_N;
+
+            asm volatile ("fence.proxy.async.shared::cta;" ::: "memory"); // Ensure SMEM writes are visible
+
+            // Ensure all SMEM writes are visible and signal barrier
+            if (elect_one_sync()) {
+                mbar_arrive(mbar_addr_tile_ready + 8 * tile_stage, 1);
             }
         }
-        bool update_group = (group != last_group);
-        if (update_group) {
-            last_group = group;
-            sfa_gmem_base = groups[group].sfa_addr;
-            sfb_gmem_base = groups[group].sfb_addr;
-            tmap_a = &a_tmaps[group];
-            tmap_b = &b_tmaps[group];
-            tmap_c = &c_tmaps[group];
-            asm volatile(
-                "fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
-                :
-                : "l"(tmap_a)
-            );
-            asm volatile(
-                "fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
-                :
-                : "l"(tmap_b)
-            );
-            asm volatile(
-                "fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
-                :
-                : "l"(tmap_c)
-            );
+
+        // All other warps wait for tile info to be ready
+        mbar_wait(mbar_addr_tile_ready + 8 * tile_stage, tile_ready_phase[tile_stage]);
+        tile_ready_phase[tile_stage] ^= 1;
+
+        int m_off = m_off_arr[tile_stage];
+        int n_off = n_off_arr[tile_stage];
+        int cur_group = group_vals[tile_stage];
+
+        if constexpr (NK_VAR) {
+            N = N_vals[tile_stage];
+            K = K_vals[tile_stage];
         }
 
-        int group_tile = tile_idx - groups[group].block_start;
-        int row_idx = group_tile / n_tiles;
-        int col_idx = group_tile % n_tiles;
-        int m_off = row_idx * TD_CTA_M;
-        int n_off = col_idx * TD_CTA_N;
-
-        // Perform MMA
         // TMA thread loops over SMEM tile stages and loads from GMEM->SMEM
         if (warp_id == TMA_WARP) {
             if (elect_one_sync()) {
@@ -702,8 +896,6 @@ __global__ void __cluster_dims__(1, 1, 1) nvfp4_group_gemm_kernel(GroupDesc* gro
                     const int sfb_smem_stage_ptr = sfb_smem_ptr + stage * SF_SMEM_TILESZ  * (TD_MMA_N == 256 ? 2 : 1);
                     const int mbar_addr_tma_stage = mbar_addr_tma + stage * 8;
 
-                    tcgen05_3dtma_g2s_ab<1>(a_smem_stage_ptr, tmap_a, m_off, k_off_coremat, mbar_addr_tma_stage, CacheHintSm100::EVICT_NORMAL);
-                    tcgen05_3dtma_g2s_ab<1>(b_smem_stage_ptr, tmap_b, n_off, k_off_coremat, mbar_addr_tma_stage, CacheHintSm100::EVICT_NORMAL);
                     /*
                         Scale factors are stored in global memory in 4x4x32 chunks, i.e. 512B chunks where each chunk represents a
                         128x4 chunk of the SF matrix (in M or N xK)
@@ -711,37 +903,55 @@ __global__ void __cluster_dims__(1, 1, 1) nvfp4_group_gemm_kernel(GroupDesc* gro
                         k_off / 64 represents the number of 128x4 (512B) chunks along the K dimension which are contiguous (4 * SF_BLOCKS_SIZE = 64)
                         m/n_off / 128 represents the number of 512B chunks along the M dimension which are strided by K / 64 512B chunks
                     */
-                    const uint8_t* sfa_g_ptr = sfa_gmem_base + ((k_off / 64) + (m_off / 128) * (K / 64)) * 512; // ISSUE: These could be just simple bit shifts, adjust if compiler doesn't
-                    const uint8_t* sfb_g_ptr = sfb_gmem_base + ((k_off / 64) + (n_off / 128) * (K / 64)) * 512;
+                    const uint8_t* sfa_g_ptr = groups[cur_group].sfa_addr + ((k_off / 64) + (m_off / 128) * (K / 64)) * 512; // ISSUE: These could be just simple bit shifts, adjust if compiler doesn't
+                    const uint8_t* sfb_g_ptr = groups[cur_group].sfb_addr + ((k_off / 64) + (n_off / 128) * (K / 64)) * 512;
+
+                    // Signal that we expect SMEM_TILE_SZ bytes to arrive on the local mbar object before proceeding to next phase
+                    mbar_arrive_expect(mbar_addr_tma_stage, SMEM_TILE_SZ);
+
+                    if (is_leader) {
+                        // Leader CTA issues multicast TMA
+                        tcgen05_3dtma_g2s_ab_multicast<1, CLUSTER_MASK>(a_smem_stage_ptr, &groups[cur_group].tmap_a, m_off, k_off_coremat, mbar_addr_tma_stage, CacheHintSm100::EVICT_NORMAL);
+                    }
+                    tcgen05_3dtma_g2s_ab<1>(b_smem_stage_ptr, &groups[cur_group].tmap_b, n_off, k_off_coremat, mbar_addr_tma_stage, CacheHintSm100::EVICT_NORMAL);
                     tcgen05_1dtma_g2s_sf(sfa_smem_stage_ptr, sfa_g_ptr, SF_SMEM_TILESZ, mbar_addr_tma_stage, CacheHintSm100::EVICT_NORMAL);
                     tcgen05_1dtma_g2s_sf(sfb_smem_stage_ptr, sfb_g_ptr, SF_SMEM_TILESZ, mbar_addr_tma_stage, CacheHintSm100::EVICT_NORMAL);
                     if constexpr (TD_MMA_N == 256) {
                         tcgen05_1dtma_g2s_sf(sfb_smem_stage_ptr+SF_SMEM_TILESZ, sfb_g_ptr + (K / 64)*512, SF_SMEM_TILESZ, mbar_addr_tma_stage, CacheHintSm100::EVICT_NORMAL);
                     }
-                    
-                    // Signal in mbarrier that we expect SMEM_TILE_SZ bytes to arrive on this mbar object before proceeding to next phase
-                    mbar_arrive_expect(mbar_addr_tma_stage, SMEM_TILE_SZ);
+
                 };
 
-                // Fill the TMA pipe
-                for (int stage = 0; stage < PIPE_STAGES; stage++) {
-                    tma_load_stage(stage * TD_SMEM_K, stage);
+                int k_off = 0;
+                // If first tile kick off pipeline without waiting on MMA
+                if (tile_idx == blockIdx.x) {
+                    const int k_tiles = K / TD_SMEM_K;
+                    const int prefetch_stages = PIPE_STAGES > k_tiles ? k_tiles : PIPE_STAGES;
+                    for (int stage = 0; stage < prefetch_stages; stage++) {
+                        tma_load_stage(stage * TD_SMEM_K, stage);
+                    }
+                    k_off = TD_SMEM_K * prefetch_stages;
                 }
 
                 // Cycle through tile stages, loading tiles once no longer in use by the MMA stage
-                int stage = 0;
-                for (int k_off = TD_SMEM_K * PIPE_STAGES; k_off < K; k_off += TD_SMEM_K) {
-                  mbar_wait(mbar_addr_mma + stage * 8, (((k_off / TD_SMEM_K) / PIPE_STAGES) - 1) % 2);
-                  tma_load_stage(k_off, stage);
-                  stage = (stage + 1) % PIPE_STAGES;
+                glob_k_off += k_off;
+                for (; k_off < K; k_off += TD_SMEM_K) {
+                    const int stage = (glob_k_off / TD_SMEM_K) % PIPE_STAGES;
+                    mbar_wait(mbar_addr_mma + stage * 8, (((glob_k_off / TD_SMEM_K) / PIPE_STAGES) - 1) % 2);
+                    tma_load_stage(k_off, stage);
+                    glob_k_off += TD_SMEM_K;
                 }
             }
         }
         // MMA thread loops over SMEM tile stages, loads TMEM and computes MMA ops
         else if (warp_id == MMA_WARP && elect_one_sync()) {
+            const int tmem_addr_result = tmem_result_ptrs[tmem_buf];
+            const int tmem_addr_sfa = tmem_sfa_ptrs[tmem_buf];
+            const int tmem_addr_sfb = tmem_sfb_ptrs[tmem_buf];
+
             for (int k_off = 0; k_off < K; k_off += TD_SMEM_K) {
-                const int stage = (k_off / TD_SMEM_K) % PIPE_STAGES;
-                mbar_wait(mbar_addr_tma + stage * 8, ((k_off / TD_SMEM_K) / PIPE_STAGES) % 2);
+                const int stage = (glob_k_off / TD_SMEM_K) % PIPE_STAGES;
+                mbar_wait(mbar_addr_tma + stage * 8, ((glob_k_off / TD_SMEM_K) / PIPE_STAGES) % 2);
 
                 const int a_smem_stage_ptr = a_smem_ptr + stage * A_SMEM_TILESZ;
                 const int b_smem_stage_ptr = b_smem_ptr + stage * B_SMEM_TILESZ;
@@ -751,12 +961,12 @@ __global__ void __cluster_dims__(1, 1, 1) nvfp4_group_gemm_kernel(GroupDesc* gro
 
                 // Load scale factors SMEM -> TMEM
                 for (int sub_k_iter = 0; sub_k_iter < TD_SMEM_K / TD_MMA_K; sub_k_iter++) {
-                    uint64_t sfa_desc = make_smem_desc<0, false>(sfa_smem_stage_ptr + (sub_k_iter * 512)); // ISSUE: verify this should input 0 here
-                    uint64_t sfb_desc = make_smem_desc<0, false>(sfb_smem_stage_ptr + (sub_k_iter * 512));
+                    uint64_t sfa_desc = make_smem_desc<0>(sfa_smem_stage_ptr + (sub_k_iter * 512)); // ISSUE: verify this should input 0 here
+                    uint64_t sfb_desc = make_smem_desc<0>(sfb_smem_stage_ptr + (sub_k_iter * 512));
                     tcgen05_cp<1>(tmem_addr_sfa + 4 * sub_k_iter, sfa_desc);
                     tcgen05_cp<1>(tmem_addr_sfb + MAX<TD_MMA_N / 32, 4>() * sub_k_iter, sfb_desc);
                     if constexpr (TD_MMA_N == 256) {
-                        uint64_t sfb_desc2 = make_smem_desc<0, false>(sfb_smem_stage_ptr + SF_SMEM_TILESZ + (sub_k_iter * 512));
+                        uint64_t sfb_desc2 = make_smem_desc<0>(sfb_smem_stage_ptr + SF_SMEM_TILESZ + (sub_k_iter * 512));
                         tcgen05_cp<1>(tmem_addr_sfb + 8 * sub_k_iter + 4, sfb_desc2);
                     }
                 }
@@ -765,13 +975,13 @@ __global__ void __cluster_dims__(1, 1, 1) nvfp4_group_gemm_kernel(GroupDesc* gro
                 for (int sub_k_iter = 0; sub_k_iter < TD_SMEM_K / TD_MMA_K; sub_k_iter++) {
                     // Stride computed differently depending on swizzle mode because it changes core matrix shape
                     uint64_t a_desc, b_desc;
-                    if constexpr (SWIZZLE) {
-                        a_desc = make_smem_desc<TD_MMA_M, SWIZZLE>(a_smem_stage_ptr + sub_k_iter * 32);
-                        b_desc = make_smem_desc<TD_MMA_N, SWIZZLE>(b_smem_stage_ptr + sub_k_iter * 32);
+                    if constexpr (SWIZZLE_TYPE != CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE) {
+                        a_desc = make_smem_desc<TD_MMA_M, SWIZZLE_TYPE>(a_smem_stage_ptr + sub_k_iter * 32);
+                        b_desc = make_smem_desc<TD_MMA_N, SWIZZLE_TYPE>(b_smem_stage_ptr + sub_k_iter * 32);
                     }
                     else {
-                        a_desc = make_smem_desc<TD_MMA_M, SWIZZLE>(a_smem_stage_ptr + sub_k_iter * TD_MMA_K * TD_MMA_M / 2);
-                        b_desc = make_smem_desc<TD_MMA_N, SWIZZLE>(b_smem_stage_ptr + sub_k_iter * TD_MMA_K * TD_MMA_N / 2);
+                        a_desc = make_smem_desc<TD_MMA_M, SWIZZLE_TYPE>(a_smem_stage_ptr + sub_k_iter * TD_MMA_K * TD_MMA_M / 2);
+                        b_desc = make_smem_desc<TD_MMA_N, SWIZZLE_TYPE>(b_smem_stage_ptr + sub_k_iter * TD_MMA_K * TD_MMA_N / 2);
                     }
                     int sfa_tmem = tmem_addr_sfa + 4 * sub_k_iter;
                     int sfb_tmem;
@@ -784,20 +994,27 @@ __global__ void __cluster_dims__(1, 1, 1) nvfp4_group_gemm_kernel(GroupDesc* gro
                     tcgen05_mma_nvfp4<1>(tmem_addr_result, a_desc, b_desc, make_instr_desc<TD_MMA_M, TD_MMA_N>(), sfa_tmem, sfb_tmem, k_off + sub_k_iter); // Inputting k_off like this will set enable-input-d so only on the first mma we 0 out the result space in TMEM
                 }
                 // signal MMA done
-                tcgen05_commit(mbar_addr_mma_stage);
+                tcgen05_commit_multicast<CLUSTER_MASK>(mbar_addr_mma_stage);
+                glob_k_off += TD_SMEM_K;
             }
 
             // Signal epilogue to start
-            tcgen05_commit(mbar_addr_epi);
+            tcgen05_commit(mbar_addr_epi + 8*tmem_buf);
         }
         // All warps aside from the two for TMA/MMA are dedicated to the epilogue
-        else if (warp_id < NUM_WARPS - 2) {
-            mbar_wait(mbar_addr_epi, 0);
-            asm volatile("tcgen05.fence::after_thread_sync;"); // ISSUE: Verify we need this
+        else if (warp_id < NUM_WARPS - 3) {
+            const int M = M_vals[tile_stage];
 
+            const int tmem_addr_result = tmem_result_ptrs[tmem_buf];
+
+            mbar_wait(mbar_addr_epi + tmem_buf*8, epi_phase[tmem_buf]);
+            epi_phase[tmem_buf] ^= 1;
+
+            asm volatile("tcgen05.fence::after_thread_sync;");
+        
             constexpr int res_per_thrd = 4 * (OUT_N_CHUNK / 8);
             float results[res_per_thrd];
-            constexpr int rows_per_warp = TD_MMA_M / (NUM_WARPS - 2);
+            constexpr int rows_per_warp = TD_MMA_M / (NUM_WARPS - 3);
             for (int chunk = 0; chunk < TD_MMA_N / OUT_N_CHUNK; chunk++) {
                 int buf = chunk & 0x1; // faster chunk % 2
 
@@ -807,12 +1024,12 @@ __global__ void __cluster_dims__(1, 1, 1) nvfp4_group_gemm_kernel(GroupDesc* gro
                         asm volatile("cp.async.bulk.wait_group.read 1;");
                     }
                     // All threads must wait for the elected thread's wait to complete
-                    asm volatile("bar.sync 2, %0;" :: "r"(WARP_SIZE * (NUM_WARPS - 2)) : "memory");
+                    asm volatile("bar.sync 2, %0;" :: "r"(WARP_SIZE * (NUM_WARPS - 3)) : "memory");
                 }
 
                 // Load chunk from TMEM -> REGS, cvt to half, store to SMEM
                 for (int sub_m = 0; sub_m < rows_per_warp / 16; sub_m++) {
-                    if (m_off + warp_id * rows_per_warp + sub_m * 16 > groups[group].M) {
+                    if (m_off + warp_id * rows_per_warp + sub_m * 16 > M) {
                         break;
                     }
 
@@ -825,232 +1042,150 @@ __global__ void __cluster_dims__(1, 1, 1) nvfp4_group_gemm_kernel(GroupDesc* gro
                     for (int i = 0; i < OUT_N_CHUNK / 8; i++) {
                         const int m_offset = warp_id * rows_per_warp + sub_m * 16 + lane_id / 4;
                         const int n_offset = i * 8 + (lane_id % 4) * 2;
-                        if (m_offset + m_off < groups[group].M) {
+                        if (m_offset + m_off < M) {
                             reinterpret_cast<half2 *>(c_smem + (C_CHUNK_SMEM_TILESZ * buf) + m_offset*OUT_N_CHUNK + n_offset)[0] = __float22half2_rn({results[i * 4], results[i * 4 + 1]});
                         }
-                        if (m_offset + m_off + 8 < groups[group].M) {
+                        if (m_offset + m_off + 8 < M) {
                             reinterpret_cast<half2 *>(c_smem + (C_CHUNK_SMEM_TILESZ * buf) + (m_offset + 8)*OUT_N_CHUNK + n_offset)[0] = __float22half2_rn({results[i * 4 + 2], results[i * 4 + 3]});
                         }
                     }
                 }
-                // Sync epilogue warps to ensure all SMEM writes complete
-                asm volatile("bar.sync 2, %0;" :: "r"(WARP_SIZE * (NUM_WARPS - 2)) : "memory");
+                
+                asm volatile("bar.sync 2, %0;" :: "r"(WARP_SIZE * (NUM_WARPS - 3)) : "memory");
 
                 // Only ONE thread issues TMA store and manages wait_group
                 if (warp_id == 0 && elect_one_sync()) {
-                    tcgen05_2dtma_s2g_c(c_smem_ptr + (C_CHUNK_SMEM_TILESZ * 2 * buf), tmap_c, m_off, n_off + (chunk * OUT_N_CHUNK), CacheHintSm100::EVICT_NORMAL);
+                    asm volatile ("fence.proxy.async.shared::cta;" ::: "memory"); // ensure all SMEM writes complete and are visible to async proxy
+                    tcgen05_2dtma_s2g_c(c_smem_ptr + (C_CHUNK_SMEM_TILESZ * 2 * buf), &groups[cur_group].tmap_c, m_off, n_off + (chunk * OUT_N_CHUNK), CacheHintSm100::EVICT_NORMAL);
                     asm volatile("cp.async.bulk.commit_group;");
                 }
             }
             if (warp_id == 0 && elect_one_sync()) {
                 asm volatile("cp.async.bulk.wait_group.read 0;");
+                mbar_arrive(mbar_addr_epi_done + tmem_buf*8, 1);
             }
-        } 
-        __syncthreads(); // Ensure all previous results have been read from TMEM and written to GMEM before starting computation on the next work tile
-
-#if DEBUG
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            printf("Block 0: About to wait on mbar_clc\\n");
-        }
-#endif
-        // look at result of stealing next tile with CLC
-        mbar_wait(mbar_addr_clc, clc_phase);
-        clc_phase ^= 1;
-#if DEBUG
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            printf("Block 0: Passed mbar_clc wait\\n");
-        }
-#endif
-        tile_idx = clc_check_steal(clc_result_addr);
-#if DEBUG
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            printf("Block 0: clc_check_steal returned %d\\n", tile_idx);
-        }
-#endif
-        if (tile_idx < 0) {
-            break;
+            tmem_buf = (tmem_buf + 1) % 3;
+            asm volatile("bar.sync 2, %0;" :: "r"(WARP_SIZE * (NUM_WARPS - 3)) : "memory");
         }
 
-        asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;");
-
-        // Reinitialize mbarriers for next tile
-        if (warp_id == 0 && elect_one_sync()) {
-            for (int i = 0; i < PIPE_STAGES * 2 + 1; i++) {
-                mbar_init(mbar_addr_tma + i * 8, 1);
+        if constexpr (!SINGLE_WAVE) {
+            if (warp_id == MMA_WARP) {
+                tmem_buf = (tmem_buf + 1) % 3;
+                if (primed) { 
+                    mbar_wait(mbar_addr_epi_done + tmem_buf*8, epi_done_phase[tmem_buf]);
+                    epi_done_phase[tmem_buf] ^= 1;
+                } else if (tmem_buf == 2) {
+                    primed = true;
+                }
             }
-            asm volatile("fence.mbarrier_init.release.cluster;");
+            tile_stages++;
         }
-        __syncthreads();
     }
     // Free memory
     __syncthreads();
-    if (warp_id == 0) { tcgen05_dealloc_tmem<1>(tmem_addr_result, TD_MMA_N * 2); }
+    if (warp_id == 0) { tcgen05_dealloc_tmem<1>(tmem_addr_base, TD_MMA_N * 2 * 2); }
 }
 
-
-
-static bool allocated = false;
+static bool setup = false;
 static bool attr_set = false;
 static PFN_cuTensorMapEncodeTiled_v12000 cuTensorMapEncodeTiled_fn;
-static char* h_mem;
-static char* d_mem;
 
-#define TIMING_DEBUG 0
-
-#if TIMING_DEBUG
-struct TimingStats {
-    double tma_us_total = 0.0;
-    double memcpy_us_total = 0.0;
-    double kernel_us_total = 0.0;
-    double total_us_total = 0.0;
-    int count = 0;
-
-    void record(float tma_ms, float memcpy_ms, float kernel_ms) {
-        tma_us_total += tma_ms * 1000.0;
-        memcpy_us_total += memcpy_ms * 1000.0;
-        kernel_us_total += kernel_ms * 1000.0;
-        total_us_total += (tma_ms + memcpy_ms + kernel_ms) * 1000.0;
-        count++;
-    }
-
-    void print_current(float tma_ms, float memcpy_ms, float kernel_ms) {
-        printf("[nvfp4_group_gemm] tma: %.2f us | cudaMemcpy: %.2f us | kernel: %.2f us | total: %.2f us\\n",
-               tma_ms * 1000.0f, memcpy_ms * 1000.0f, kernel_ms * 1000.0f, (tma_ms + memcpy_ms + kernel_ms) * 1000.0f);
-    }
-
-    void print_avg() {
-        if (count == 0) return;
-        printf("[nvfp4_group_gemm avg over %d calls] tma: %.2f us | cudaMemcpy: %.2f us | kernel: %.2f us | total: %.2f us\\n",
-               count,
-               tma_us_total / count,
-               memcpy_us_total / count,
-               kernel_us_total / count,
-               total_us_total / count);
-    }
-};
-
-static TimingStats timing_stats;
-#endif
-void nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>>& abc_tensors, const std::vector<std::tuple<torch::Tensor, torch::Tensor>>& sf_tensors, const std::vector<std::tuple<int, int, int, int>>& prob_sizes, int N, int K, int G) {
-
+void nvfp4_group_gemm(torch::Tensor A_ptrs, torch::Tensor B_ptrs, torch::Tensor C_ptrs, const std::vector<std::tuple<torch::Tensor, torch::Tensor>>& sf_tensors, const std::vector<std::tuple<int, int, int, int>>& prob_sizes, int N, int K, int G) {
     // Constants
     constexpr int M_TILE_SIZE = 128;
     constexpr int K_MMA_SIZE = 64;
-    constexpr int NUM_WARPS = 6;
-    constexpr int MAX_G = 8; // Maximum expected group size for a cross-call persistent kernel
+    constexpr int NUM_WARPS = 7;
 
     // Configurables
     constexpr int N_TILE_SIZE = 128;
     constexpr int K_TILE_SIZE = 256;
-    constexpr bool SWIZZLE = true;
     constexpr int PIPE_STAGES = 5;
     constexpr int OUT_N_CHUNK = 32;
+    constexpr int TILE_DESC_PIPE_STAGES = 5;
+    constexpr int CLUSTER_SIZE = 2;
 
-    constexpr CUtensorMapSwizzle SWIZZLE_TYPE = SWIZZLE ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE;
+    constexpr CUtensorMapSwizzle SWIZZLE_TYPE = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B;
 
-    if (!allocated) {
+    // Build GroupDescs on the stack — passed directly as a kernel argument (constant memory)
+    GroupDescs gd = {};
+    bool nk_var = false;
+    if (!setup) {
         cuTensorMapEncodeTiled_fn = get_cuTensorMapEncodeTiled();
-        cudaMallocHost(&h_mem, MAX_G * sizeof(GroupDesc) + 3 * G * sizeof(CUtensorMap));
-        cudaMalloc(&d_mem, MAX_G * sizeof(GroupDesc) + 3 * G * sizeof(CUtensorMap));
-        allocated = true;
     }
-
-#if TIMING_DEBUG
-    cudaEvent_t tma_start, tma_end;
-    cudaEventCreate(&tma_start);
-    cudaEventCreate(&tma_end);
-    cudaEventRecord(tma_start);
-#endif
-    CUtensorMap* tmaps = reinterpret_cast<CUtensorMap*>(h_mem + MAX_G * sizeof(GroupDesc));
-    CUtensorMap* A_tmaps = tmaps;
-    CUtensorMap* B_tmaps = A_tmaps + G;
-    CUtensorMap* C_tmaps = B_tmaps + G;
-    for (int i = 0; i < G; ++i) {
-        tma_3d_map_ab<M_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled_fn, &A_tmaps[i], reinterpret_cast<void*>(std::get<0>(abc_tensors[i]).data_ptr()), std::get<0>(prob_sizes[i]), K);
-        tma_3d_map_ab<N_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled_fn, &B_tmaps[i], reinterpret_cast<void*>(std::get<1>(abc_tensors[i]).data_ptr()), N, K);
-        tma_2d_map_c_init<M_TILE_SIZE, OUT_N_CHUNK>(cuTensorMapEncodeTiled_fn, &C_tmaps[i], reinterpret_cast<void*>(std::get<2>(abc_tensors[i]).data_ptr()), std::get<0>(prob_sizes[i]), N);
-    }
-#if TIMING_DEBUG
-    cudaEventRecord(tma_end);
-    cudaEventSynchronize(tma_end);
-    float tma_ms = 0.0f;
-    cudaEventElapsedTime(&tma_ms, tma_start, tma_end);
-    cudaEventDestroy(tma_start);
-    cudaEventDestroy(tma_end);
-#endif
-
-    GroupDesc* h_groups = reinterpret_cast<GroupDesc*>(h_mem);
-    const int N_blocks = CEIL_DIV(N, N_TILE_SIZE);
+    uint64_t* A_ptrs_data = A_ptrs.data_ptr<uint64_t>();
+    uint64_t* B_ptrs_data = B_ptrs.data_ptr<uint64_t>();
+    uint64_t* C_ptrs_data = C_ptrs.data_ptr<uint64_t>();
     int total_tiles = 0;
     for (int i = 0; i < G; i++) {
-        h_groups[i].A_addr     = std::get<0>(abc_tensors[i]).data_ptr();
-        h_groups[i].B_addr     = std::get<1>(abc_tensors[i]).data_ptr();
-        h_groups[i].C_addr     = reinterpret_cast<__half*>(std::get<2>(abc_tensors[i]).data_ptr());
-        h_groups[i].sfa_addr   = reinterpret_cast<uint8_t*>(std::get<0>(sf_tensors[i]).data_ptr());
-        h_groups[i].sfb_addr   = reinterpret_cast<uint8_t*>(std::get<1>(sf_tensors[i]).data_ptr());
-
         int M_size = std::get<0>(prob_sizes[i]);
-        h_groups[i].M          = M_size;
-        h_groups[i].block_start = total_tiles;
-        total_tiles += CEIL_DIV(M_size, M_TILE_SIZE) * N_blocks;
-    }
-    int NUM_CTAS = total_tiles;
+        int N_size = std::get<1>(prob_sizes[i]);
+        int K_size = std::get<2>(prob_sizes[i]);
+        tma_3d_map_ab<M_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled_fn, &gd.groups[i].tmap_a, reinterpret_cast<void*>(A_ptrs_data[i]), M_size, K_size);
+        tma_3d_map_ab<N_TILE_SIZE, K_TILE_SIZE, SWIZZLE_TYPE>::init(cuTensorMapEncodeTiled_fn, &gd.groups[i].tmap_b, reinterpret_cast<void*>(B_ptrs_data[i]), N_size, K_size);
+        tma_2d_map_c_init<M_TILE_SIZE, OUT_N_CHUNK>(cuTensorMapEncodeTiled_fn, &gd.groups[i].tmap_c, reinterpret_cast<__half*>(C_ptrs_data[i]), M_size, N_size);
 
-    // --- Timing: cudaMemcpy (disabled — using zero-copy mapped memory) ---
-#if TIMING_DEBUG
-    cudaEvent_t memcpy_start, memcpy_end;
-    cudaEventCreate(&memcpy_start);
-    cudaEventCreate(&memcpy_end);
-    cudaEventRecord(memcpy_start);
-#endif
-    cudaMemcpyAsync(d_mem, h_mem, MAX_G * sizeof(GroupDesc) + 3 * G * sizeof(CUtensorMap), cudaMemcpyHostToDevice, 0);
-#if TIMING_DEBUG
-    cudaEventRecord(memcpy_end);
-    cudaEventSynchronize(memcpy_end);
-    float memcpy_ms = 0.0f;
-    cudaEventElapsedTime(&memcpy_ms, memcpy_start, memcpy_end);
-    cudaEventDestroy(memcpy_start);
-    cudaEventDestroy(memcpy_end);
-#endif
+        gd.groups[i].sfa_addr    = reinterpret_cast<uint8_t*>(std::get<0>(sf_tensors[i]).data_ptr());
+        gd.groups[i].sfb_addr    = reinterpret_cast<uint8_t*>(std::get<1>(sf_tensors[i]).data_ptr());
+
+        gd.groups[i].M           = M_size;
+        gd.groups[i].N           = N_size;
+        gd.groups[i].K           = K_size;
+        gd.groups[i].block_start = total_tiles;
+        total_tiles += CEIL_DIV(M_size, M_TILE_SIZE) * CEIL_DIV(N_size, N_TILE_SIZE);
+        if (N_size != N || K_size != K) {
+            nk_var = true;
+        }
+    }
+    bool SINGLE_WAVE = false;
+    int NUM_CTAS = 148;
+    if (total_tiles < 148) {
+        NUM_CTAS = total_tiles;
+        SINGLE_WAVE = true;
+    }
 
     // === KERNEL LAUNCH ===
-    auto kernel_inst = nvfp4_group_gemm_kernel<M_TILE_SIZE, N_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_MMA_SIZE, SWIZZLE, PIPE_STAGES, NUM_WARPS, OUT_N_CHUNK>;
+    auto kernel_multiwave_nkconst = nvfp4_group_gemm_kernel<M_TILE_SIZE, N_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_MMA_SIZE, SWIZZLE_TYPE, PIPE_STAGES, NUM_WARPS, OUT_N_CHUNK, TILE_DESC_PIPE_STAGES, CLUSTER_SIZE, false, false>;
+    auto kernel_singlewave_nkconst = nvfp4_group_gemm_kernel<M_TILE_SIZE, N_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_MMA_SIZE, SWIZZLE_TYPE, PIPE_STAGES, NUM_WARPS, OUT_N_CHUNK, TILE_DESC_PIPE_STAGES, CLUSTER_SIZE, true, false>;
+    auto kernel_multiwave_nkvar = nvfp4_group_gemm_kernel<M_TILE_SIZE, N_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_MMA_SIZE, SWIZZLE_TYPE, PIPE_STAGES, NUM_WARPS, OUT_N_CHUNK, TILE_DESC_PIPE_STAGES, 1, false, true>;
+    auto kernel_singlewave_nkvar = nvfp4_group_gemm_kernel<M_TILE_SIZE, N_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_TILE_SIZE, M_TILE_SIZE, N_TILE_SIZE, K_MMA_SIZE, SWIZZLE_TYPE, PIPE_STAGES, NUM_WARPS, OUT_N_CHUNK, TILE_DESC_PIPE_STAGES, 1, true, true>;
 
     if (!attr_set) {
         cudaFuncSetAttribute(
-            kernel_inst,
+            kernel_multiwave_nkconst,
+            cudaFuncAttributePreferredSharedMemoryCarveout,
+            cudaSharedmemCarveoutMaxShared  // Maximum shared memory
+        );
+        cudaFuncSetAttribute(
+            kernel_singlewave_nkconst,
+            cudaFuncAttributePreferredSharedMemoryCarveout,
+            cudaSharedmemCarveoutMaxShared  // Maximum shared memory
+        );
+        cudaFuncSetAttribute(
+            kernel_multiwave_nkvar,
+            cudaFuncAttributePreferredSharedMemoryCarveout,
+            cudaSharedmemCarveoutMaxShared  // Maximum shared memory
+        );
+        cudaFuncSetAttribute(
+            kernel_singlewave_nkvar,
             cudaFuncAttributePreferredSharedMemoryCarveout,
             cudaSharedmemCarveoutMaxShared  // Maximum shared memory
         );
         attr_set = true;
     }
 
-    // --- Timing: kernel ---
-#if TIMING_DEBUG
-    cudaEvent_t kernel_start, kernel_end;
-    cudaEventCreate(&kernel_start);
-    cudaEventCreate(&kernel_end);
-    cudaEventRecord(kernel_start);
-#endif
     constexpr int threads = WARP_SIZE * NUM_WARPS;
-    GroupDesc* d_groups = reinterpret_cast<GroupDesc*>(d_mem);
-    CUtensorMap* d_tmaps = reinterpret_cast<CUtensorMap*>(d_mem + MAX_G * sizeof(GroupDesc));
-    kernel_inst<<<NUM_CTAS, threads>>>(d_groups, d_tmaps, d_tmaps + G, d_tmaps + 2*G, total_tiles, N, K, G);
-#if TIMING_DEBUG
-    cudaEventRecord(kernel_end);
-    cudaEventSynchronize(kernel_end);
-    float kernel_ms = 0.0f;
-    cudaEventElapsedTime(&kernel_ms, kernel_start, kernel_end);
-    cudaEventDestroy(kernel_start);
-    cudaEventDestroy(kernel_end);
-
-    timing_stats.record(tma_ms, memcpy_ms, kernel_ms);
-    timing_stats.print_current(tma_ms, memcpy_ms, kernel_ms);
-    timing_stats.print_avg();
-#endif
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(cudaGetErrorString(err));
+    if (SINGLE_WAVE) {
+        if (nk_var) {
+            kernel_singlewave_nkvar<<<NUM_CTAS, threads>>>(gd, total_tiles, N, K, G);
+        } else {
+            kernel_singlewave_nkconst<<<NUM_CTAS, threads>>>(gd, total_tiles, N, K, G);
+        }
+    } else {
+        if (nk_var) {
+            kernel_multiwave_nkvar<<<NUM_CTAS, threads>>>(gd, total_tiles, N, K, G);
+        } else {
+            kernel_multiwave_nkconst<<<NUM_CTAS, threads>>>(gd, total_tiles, N, K, G);
+        }
     }
 }
 
@@ -1060,11 +1195,9 @@ nvfp4_group_gemm_cpp_source = """
 
 #include <torch/extension.h>
 
-void nvfp4_group_gemm(const std::vector<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>>& abc_tensors, const std::vector<std::tuple<torch::Tensor, torch::Tensor>>& sf_tensors, const std::vector<std::tuple<int, int, int, int>>& prob_sizes, int N, int K, int G);
+void nvfp4_group_gemm(torch::Tensor A_ptrs, torch::Tensor B_ptrs, torch::Tensor C_ptrs, const std::vector<std::tuple<torch::Tensor, torch::Tensor>>& sf_tensors, const std::vector<std::tuple<int, int, int, int>>& prob_sizes, int N, int K, int G);
 
 """
-
-
 
 
 nvfp4_group_gemm_module = load_inline(
@@ -1080,7 +1213,8 @@ nvfp4_group_gemm_module = load_inline(
         '-gencode=arch=compute_100a,code=sm_100a',
         '-Xptxas', '--allow-expensive-optimizations=true',
         '--use_fast_math',
-        '-lineinfo',
+        '--relocatable-device-code=false',
+        # '-lineinfo',
     ],
 )
 
@@ -1096,11 +1230,16 @@ def custom_kernel(data: input_t) -> output_t:
     problem_sizes (l is always 1): [(m, n, k, l), (m, n, k, l), ...]
     """
 
+    A_ptrs = torch.tensor([a.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
+    B_ptrs = torch.tensor([b.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
+    C_ptrs = torch.tensor([c.data_ptr() for (a,b,c) in abc_tensors], dtype=torch.uint64, device='cpu')
+
     G = len(abc_tensors)
 
     N = problem_sizes[0][1]
     K = problem_sizes[0][2]
-    # nvfp4_group_gemm_module.nvfp4_group_gemm(A_ptrs, B_ptrs, C_ptrs, SFA_ptrs, SFB_ptrs, M_sizes, N, K, G)
-    nvfp4_group_gemm_module.nvfp4_group_gemm(abc_tensors, sfasfb_tensors_reordered, problem_sizes, N, K, G)
+
+    nvfp4_group_gemm_module.nvfp4_group_gemm(A_ptrs, B_ptrs, C_ptrs, sfasfb_tensors_reordered, problem_sizes, N, K, G)
 
     return [c for (a, b, c) in abc_tensors]
+

@@ -929,7 +929,7 @@ static PFN_cuTensorMapEncodeTiled_v12000 cuTensorMapEncodeTiled_fn;
 static CUtensorMap tmap_a_temp, tmap_b_temp, tmap_c_temp;
 static int cache_N = 0, cache_K = 0;
 
-#define TIMING_DEBUG 1
+#define TIMING_DEBUG 0
 
 #if TIMING_DEBUG
 struct TimingStats {

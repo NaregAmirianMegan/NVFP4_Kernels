@@ -176,7 +176,7 @@ def _run_single_benchmark(
     from torch.cuda.nvtx import range as nvtx_range
     from utils import clear_l2_cache_large as clear_l2_cache
     from reference import check_implementation, generate_input
-    from sub_ptx_v2 import custom_kernel
+    from sub_ptx_v2_splitk import custom_kernel
 
     durations = []
     data_list = []
