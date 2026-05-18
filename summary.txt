@@ -2584,9 +2584,27 @@ if (update_group) {
 }
 ```
 
-Inside the TMA warp if we need to update the tensor map we perform three `tensormap.replace` operations: one to update matrix A's M dimension (since this varies across groups) and two to update the address of the A and B matrices. Only one thread in the TMA warp executes these instructions, but the warp should be synchronized for the next phase of the update. We issue three `tensormap.cp_fenceproxy` instructions 
+Inside the TMA warp if we need to update the tensor map we perform three `tensormap.replace` operations: one to update matrix A's M dimension (since this varies across groups) and two to update the address of the A and B matrices. Only one thread in the TMA warp executes these instructions, but the warp should be synchronized for the next phase of the update. We issue three `tensormap.cp_fenceproxy` instructions.
 
+```
+tensormap.cp_fenceproxy.cp_qualifiers.fence_qualifiers.sync.aligned  [dst], [src], size;
 
+.cp_qualifiers    = { .global.shared::cta }
+.fence_qualifiers = { .to_proxy::from_proxy.release.scope }
+.to_proxy::from_proxy  = { .tensormap::generic }
+.scope            = { .cta, .cluster, .gpu , .sys }
+```
+PTX Link: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-tensormap-cp-fenceproxy
+
+The tensormap.cp_fenceproxy instructions perform the following operations in order:
+
+1) Copies data of size specified by the size argument, in bytes, from the location specified by the address operand src in shared memory to the location specified by the address operand dst in the global memory, in the generic proxy.
+
+2) Establishes a uni-directional proxy release pattern on the ordering from the copy operation to the subsequent access performed in the tensormap proxy on the address dst.
+
+In short, this serves as a fence to make sure future TMA operations see the correct and fully updated tensor map in GMEM (ensuring the copy of the modified tensor map from SMEM to GMEM has completed).
+
+Then the rest of the kernel operates in the same way, just with the updated per CTA tensor maps. With this modification we see a large jump in performance due to the reduction in setup overhead and parallelization of tensor map initialization.
 
 
 Benchmark Results:
@@ -2595,6 +2613,182 @@ Benchmark Results:
 {'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]} -> 96.2us
 {'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]} -> 35.8us
 {'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]} ->  31.0us
+
+
+- V7 (submission_v4_3.py) -
+
+At this point we've done most of what we can to eliminate setup and teardown overhead within our kernel. We will uncover later that this is only a half truth: we've made most of the optimizations for a kernel that would run on large problem shapes (i.e. large M, N, K, G), but for small problem shapes there are other ways to make the setup and teardown even more efficient. For now we transition back to the kernel itself and further optimizations we can make on top of the optimizations we've built up over the previous two kernels (GEMM and Dual GEMM). 
+
+Due to compute resource constraints I wasn't able to collect all of the NCU statistics I would have liked throughout the optimization process; however, I was able to use mbarrier stall statistics to estimate which section of the kernel was the bottleneck. Although the TMA and MMA portions take up a significant portion of runtime (indicated by stalls on the epilogue mbarrier), we've already heavily optimized those two portions over the past two kernels. The second large contributor to runtime and thus the bottleneck is the epilogue, and there are a number of optimization tricks we've yet to implement. We start in V7 by using TMA to store the result tiles to GMEM as opposed to using standard register file -> GMEM stores.
+
+We've already covered the specifics of TMA transfers from GMEM -> SMEM. The reverse direction looks nearly identical with a few key exceptions.
+
+TMA SMEM -> GMEM variant:
+
+// shared::cta -> global
+```
+cp.async.bulk.tensor.dim.dst.src{.load_mode}.completion_mechanism{.level::cache_hint}
+                                   [tensorMap, tensorCoords], [srcMem] {, cache-policy}
+
+.dst =                  { .global }
+.src =                  { .shared::cta }
+.dim =                  { .1d, .2d, .3d, .4d, .5d }
+.completion_mechanism = { .bulk_group }
+.load_mode =            { .tile, .tile::scatter4, .im2col_no_offs }
+.level::cache_hint =    { .L2::cache_hint }
+```
+
+The key differences to note in this variant are pointer locations and the completion mechanism. In this variant we provide the SMEM address as the `srcMem` argument. Instead of using mbarriers to track the completion of this transfer, a different mechanism called `bulk_group` is used. The bulk group mechanism, as the name suggests, is a way to track the completion of a bulk amount of data transfers. This is very similar to the `tcgen05.commit` instruction covered in the GEMM kernel which allowed for waiting on a group of `tcgen05.mma` instructions to complete. In this case we use a different commit instruction than tcgen05.commit:
+
+```
+cp.async.bulk.commit_group
+```
+PTX Link: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-bulk-tensor-copy-completion
+
+cp.async.bulk.commit_group instruction creates a new per-thread bulk async-group and batches all prior cp{.reduce}.async.bulk{.prefetch}{.tensor} instructions satisfying the following conditions into the new bulk async-group:
+
+-> The prior cp{.reduce}.async.bulk{.prefetch}{.tensor} instructions use bulk_group based completion mechanism, and
+-> They are initiated by the executing thread but not committed to any bulk async-group.
+
+Once we've created a bulk group using `cp.async.bulk.commit_group` we need to then wait on the completion of all the instructions included in that bulk group. The instruction used for this is the following:
+
+```
+cp.async.bulk.wait_group{.read} N;
+```
+PTX Link: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-wait-group
+
+Causes the executing thread to wait until only N or fewer of the most recent bulk async-groups are pending and all the prior bulk async-groups committed by the executing threads are complete. For example, when N is 0, the executing thread waits on all the prior bulk async-groups to complete.
+
+The optional .read modifier indicates that the waiting has to be done until all the bulk async operations in the specified bulk async-group have completed:
+
+-> Reading from the tensormap
+-> The reading from their source locations.
+
+Including `.read` modifier essentially frees up waiting threads earlier because it doesn't have to wait until the writes finish in GMEM, only when all of the data has been read from SMEM and the tensor map used for the transfer. That being said, my experiments showed very little difference in performance between using `.read` and not.
+
+
+In order to implement TMA store in our kernel we add the same tensor map machinery we've discussed for the C matrix tensor map. Then we make the following code changes in the epilogue code:
+
+```
+__shared__ alignas(128) __half c_smem[C_SMEM_TILESZ];
+```
+
+First we reserve a tile the size of a result tile in SMEM to stage the results for the TMA transfer. Then we use the same epilogue structure we've had all along to fill out the staging SMEM tile.
+
+```
+ // Ensure SMEM writes for all epilogue warps have completed, then issue TMA store to C in GMEM
+if (warp_id == 0 && elect_one_sync()) {
+    tcgen05_2dtma_s2g_c(c_smem_ptr, g_C_tmap, m_off, n_off, CacheHintSm100::EVICT_NORMAL);
+    asm volatile("cp.async.bulk.commit_group;");
+    asm volatile("cp.async.bulk.wait_group 0;"); // ISSUE: add .read or no?
+}
+```
+
+Once we've written our results for the current work tile to SMEM we initiate the TMA transfer, add that TMA to a single bulk group, and wait on that bulk group's completion. Then we can loop and handle the next work tile.
+
+The work in the MMA and TMA warps remains the same. 
+
+Due to the larger size of our work tiles and the fact that we are transferring more data overall from the SMs to GMEM (more total result data in the group GEMM problem shapes), using TMA to store the result data massively speeds up the epilogue stores, so we see a significant boost in performance.
+
+Benchmark Results:
+
+{'g': 8, 'k': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168], 'm': [80, 176, 128, 72, 64, 248, 96, 160], 'n': [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]}  -> 58.0us
+{'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]} -> 51.6us
+{'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]} -> 24.7us
+{'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]} ->  20.9us
+
+- V8 (submission_v4_4.py) -
+
+Before diving too deep into further kernel optimizations there is another hardware feature that could potentially improve the performance of the kernel: Cluster Launch Control (CLC). 
+
+Cluster Launch Control (CLC Details) is a hardware feature introduced in the Blackwell architecture that allows for dynamic persistent kernels. These kernels are persistent in a way very similar to static persistent kernels where CTAs can stay resident on an SM and compute multiple output tiles; however, they differ in that the work each CTA ends up computing is determined dynamically at runtime rather than being defined statically.
+
+The idea is we launch the same amount of CTAs as if each CTA were going to compute a single result; however, instead of each CTA exiting once it has completed the work for a single result tile it checks to see if any CTAs have yet to be launched on the GPU, and if so, it takes the work from that CTA and computes the result itself. This accomplishes the same effect as the static persistent kernel by avoiding CTA launch overhead and allowing next tile computation overlap. The main benefit is that we don't run into the issues we encountered by affining certain result tile sets to certain CTAs.
+
+Now we review the code that implements CLC:
+
+```
+__shared__ uint4 clc_result; // result for CLC cancel requests
+int clc_result_addr = static_cast<int>(__cvta_generic_to_shared(&clc_result));
+```
+
+CLC needs a place in SMEM to store it's results, we allocate that here.
+
+```
+// Async cancellation request
+asm volatile("fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster;");
+if (warp_id == 0 && elect_one_sync()) {
+    asm volatile(
+        "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 [%0], [%1];"
+        :
+        : "r"(clc_result_addr), "r"(mbar_addr_clc)
+    );
+    mbar_arrive_expect(mbar_addr_clc, sizeof(uint4));
+}
+```
+
+This is where CLC attempts to grab a work tile that hasn't started yet. A helpful mental model is to think about all the CTAs (technically all clusters, but for now in our kernel these are the same thing) as a pool of work or result tiles to be computed, and all active CTAs are continously trying to "steal" work tiles from this pool. That's why in CLC nomenclature it's called "work stealing", because you're stealing work from a pool of work tiles when that tile originally belonged to another CTA that hasn't launched yet.
+
+At a more technical level we first ensure that the code isn't simultaneously trying to write to and read from the `clc_result` buffer in SMEM via the async and generic proxies. CLC writes the results of a "steal" operation via the async proxy to `clc_result`, the SMEM buffer, and the kernel reads that result using the generic proxy. For more details on memory proxies see that subsection in [Memory Consistency Details]. To ensure there isn't any read/write overlap causing stale data reads or corrupted data reads we insert a proxy fence between generic and async proxies.
+
+Next we issue the next work steal attempt for this CTA via `clusterlaunchcontrol.try_cancel`
+
+```
+clusterlaunchcontrol.try_cancel.async{.space}.completion_mechanism{.multicast::cluster::all}.b128 [addr], [mbar];
+
+.completion_mechanism = { .mbarrier::complete_tx::bytes };
+.space = { .shared::cta };
+```
+PTX Link: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-try-cancel
+
+The clusterlaunchcontrol.try_cancel instruction requests atomically cancelling the launch of a cluster that has not started running yet. It asynchronously writes an opaque response to shared memory indicating whether the operation succeeded or failed. The completion of the asynchronous operation is tracked using the mbarrier completion mechanism at .cluster scope. On success, the opaque response contains the ctaid of the first CTA of the canceled cluster; no other successful response from other clusterlaunchcontrol.try_cancel operations from the same grid will contain that id.
+
+In "cancelling" another clusters work, the executing cluster is essentially stealing that work tile. This is an asynchronous instruction, so we track it's completion with an mbarrier, similar to tcgen05 instructions.
+
+Lastly, we set the CLC mbarrier to expect the number of bytes that CLC writes to `clc_result` via the async proxy, `sizeof(uint4)`. As mentioned this contains the ctaid of the cancelled (or stolen) work. 
+
+```
+// look at result of stealing next tile with CLC
+mbar_wait(mbar_addr_clc, clc_phase);
+```
+
+Wait until the asynchronous CLC cancel (steal) has completed.
+
+```
+tile_idx = clc_check_steal(clc_result_addr);
+```
+
+Extract the ctaid from the opaque struct written by CLC.
+
+```
+__device__ inline int clc_check_steal(const int clc_result_addr) {
+    int res = -1;
+    asm volatile(
+        "{\\n"
+        ".reg .pred P1;\\n"
+        ".reg .b128 handle;\\n"
+        "ld.shared.b128 handle, [%1];\\n"
+        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 P1, handle;\\n"
+        "@!P1 bra.uni DONE;\\n" // if query returned false, no more work tiles to be stolen, so return -1 by doing nothing
+        "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, handle;\\n" // set res to stolen blockIdx.x
+        "DONE:\\n"
+        "}"
+        : "+r"(res)
+        : "r"(clc_result_addr)
+    );
+    return res;
+}
+```
+
+
+
+
+Benchmark Results:
+
+{'g': 8, 'k': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168], 'm': [80, 176, 128, 72, 64, 248, 96, 160], 'n': [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]}  -> 61.0us
+{'g': 8, 'k': [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], 'm': [40, 76, 168, 72, 164, 148, 196, 160], 'n': [7168, 7168, 7168, 7168, 7168, 7168, 7168, 7168]} -> 54.3us
+{'g': 2, 'k': [4096, 4096], 'm': [192, 320], 'n': [3072, 3072]} -> 24.4us
+{'g': 2, 'k': [1536, 1536], 'm': [128, 384], 'n': [4096, 4096]} ->  22.0us
 
 
 --- Terms and Concepts (Glossary) ---
@@ -2634,6 +2828,7 @@ Table of Contents:
 -> Data Layout (discuss re-arranged scale factor layouts, layouts of data in general)
 -> Host/Device Data Transfer Details (HBM, PCIE via "zero-copy" mapped)
 -> Device Memory Management
+-> Cluster Launch Control (CLC)
 
 
 --- Kernel Development Optimizations ---
@@ -2644,23 +2839,11 @@ In this section I cover some procedural and engineering related learnings and im
 -> Organization of performance data
 -> Analyzing performance of tensor cores, especially tcgen05 (normal NCU numbers can be very misleading)
 -> Notes on using LLMs for kernel development
+-> Kernel development can be a non-linear process, and it's important to keep notes and statistics on the impact of various changes
 
 
 
 
-SMEM->GMEM:
 
-TMA again, but this time we use the Shared -> GMEM variant:
-
-// shared::cta -> global
-cp.async.bulk.tensor.dim.dst.src{.load_mode}.completion_mechanism{.level::cache_hint}
-                                   [tensorMap, tensorCoords], [srcMem] {, cache-policy}
-
-.dst =                  { .global }
-.src =                  { .shared::cta }
-.dim =                  { .1d, .2d, .3d, .4d, .5d }
-.completion_mechanism = { .bulk_group }
-.load_mode =            { .tile, .tile::scatter4, .im2col_no_offs }
-.level::cache_hint =    { .L2::cache_hint }
 
 

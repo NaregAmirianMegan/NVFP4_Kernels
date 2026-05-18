@@ -1,0 +1,1216 @@
+================================================================================
+Group GEMM Kernel Iterations — Continued Worklog (V9 onward)
+================================================================================
+
+This document picks up where summary.txt leaves off (the last entry there is
+V8 / submission_v4_4.py, which introduced Cluster Launch Control). It walks
+through every kernel iteration from submission_v4_5.py through the final
+v3.py, including the experiments that failed correctness or hung. Each
+section follows the same shape as the existing summary entries: what changed
+at a technical level, why it helped (or hurt), and a code snippet where one
+illuminates the point.
+
+The benchmark scores reported below correspond to the four standard problem
+shapes, in order:
+
+  shape A: g=8, k=7168, m=[80,176,128,72,64,248,96,160], n=4096
+  shape B: g=8, k=2048, m=[40,76,168,72,164,148,196,160], n=7168
+  shape C: g=2, k=4096, m=[192,320], n=3072
+  shape D: g=2, k=1536, m=[128,384], n=4096
+
+
+- V9 (submission_v4_5.py) -
+
+Coming off V8, the dominant remaining cost inside the kernel itself is the
+epilogue. The CLC experiment in V8 actually regressed slightly compared to
+V7's static persistent kernel, so we set CLC aside for now and attack the
+epilogue directly. Two ideas land here:
+
+(1) Chunked, double-buffered epilogue. Previously each work tile filled one
+contiguous N-wide SMEM staging tile of size TD_SMEM_M x TD_SMEM_N, then
+issued a single TMA store of that whole tile. The drawback is that all of
+the TMEM->reg->half-conversion->SMEM work has to finish before the single
+TMA store can be issued, and the store has to drain before the next tile's
+epilogue can begin. We split the epilogue along the N axis into chunks of
+size OUT_N_CHUNK=32 and ping-pong between two SMEM buffers:
+
+```
+constexpr int C_CHUNK_SMEM_TILESZ = TD_SMEM_M * OUT_N_CHUNK;
+__shared__ alignas(128) __half c_smem[C_CHUNK_SMEM_TILESZ * 2];
+
+for (int chunk = 0; chunk < TD_MMA_N / OUT_N_CHUNK; chunk++) {
+    int buf = chunk & 0x1;
+
+    // Wait for the previous TMA store using THIS buffer to have read SMEM
+    if (chunk >= 2) {
+        if (warp_id == 0 && elect_one_sync()) {
+            asm volatile("cp.async.bulk.wait_group.read 1;");
+        }
+        asm volatile("bar.sync 2, %0;" :: "r"(WARP_SIZE * (NUM_WARPS - 2)) : "memory");
+    }
+
+    // TMEM -> regs -> half2 -> SMEM (this chunk only)
+    for (int sub_m = 0; sub_m < rows_per_warp / 16; sub_m++) {
+        tcgen05_ld<16, 256, OUT_N_CHUNK / 8>(results,
+            tmem_addr_result + (((warp_id * rows_per_warp) + sub_m * 16) << 16)
+                             + chunk * OUT_N_CHUNK);
+        asm volatile("tcgen05.wait::ld.sync.aligned;");
+        // ... half2 packing and writes into c_smem[buf]
+    }
+
+    asm volatile("bar.sync 2, %0;" :: "r"(WARP_SIZE * (NUM_WARPS - 2)) : "memory");
+
+    if (warp_id == 0 && elect_one_sync()) {
+        tcgen05_2dtma_s2g_c(c_smem_ptr + (C_CHUNK_SMEM_TILESZ * 2 * buf),
+                            g_C_tmap, m_off, n_off + chunk * OUT_N_CHUNK,
+                            CacheHintSm100::EVICT_NORMAL);
+        asm volatile("cp.async.bulk.commit_group;");
+    }
+}
+```
+
+The key PTX is the `cp.async.bulk.wait_group.read N` form. The `.read`
+modifier was discussed but not actually used in V7 (submission_v4_3.py);
+this is the first iteration where it pays off. The condition we need at
+the top of each chunk is "the previous use of *this SMEM buffer* has
+finished reading SMEM", not "the previous TMA store has globally
+landed in GMEM" — `.read` releases the SMEM buffer the moment the TMA
+engine has consumed it, while the GMEM write may still be in-flight in
+the L2 / HBM path. The result is that chunk i+2's TMEM->SMEM work
+overlaps in time with chunk i's SMEM->GMEM TMA transfer.
+
+Two new `tcgen05_ld` template specializations (`<16, 256, 2>` and
+`<16, 256, 4>`) are added because the chunk-size of 32 means we now need to
+load 2 or 4 256-bit blocks at a time instead of the previous 8/16/32.
+
+(2) Smaller wins on the host side. `h_groups` is moved from `malloc` to
+`cudaMallocHost`, which makes it pinned (page-locked) memory, and the H2D
+transfer is switched from `cudaMemcpy` to `cudaMemcpyAsync`. Pinned memory
+lets the driver DMA directly without bouncing through an intermediate
+staging buffer, and the async form lets the descriptor transfer overlap
+with the rest of the host-side launch path (driver work, kernel
+parameter marshalling) instead of blocking.
+
+Benchmark Results:
+
+shape A -> 48.9us
+shape B -> 43.0us
+shape C -> 15.6us
+shape D -> 13.2us
+
+
+- V10 (submission_v5.py) -
+
+V10 is a focused micro-optimization on top of V9 around when the C tensor
+map gets patched on group transitions. In V9, when a CTA crosses a group
+boundary the TMA warp does three back-to-back `tensormap.replace` + three
+`tensormap.cp_fenceproxy` operations (one each for A, B, and C) before it
+can issue the first TMA load for the new group. But the C tmap is not
+actually needed until much later, when the epilogue begins. Pushing its
+update into the epilogue path means the fenceproxy round-trip for C
+overlaps with the in-flight A/B loads and the `tcgen05.mma` instructions
+themselves.
+
+To keep the diff readable, V10 first factors the repeated tensormap-replace
+idioms into helper inlines:
+
+```
+__device__ inline void tmap_update(int local_tmap_addr, uint64_t addr) {
+    asm volatile(
+        "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;"
+        :: "r"(local_tmap_addr), "l"(addr)
+    );
+}
+__device__ inline void tmap_update(int local_tmap_addr, uint64_t addr, int M) {
+    // address + M-dim update for A's varying M
+    ...
+}
+__device__ inline void tmap_fence_proxy(CUtensorMap* g_tmap, int local_tmap_addr) {
+    asm volatile(
+        "tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [%0], [%1], 128;"
+        :: "l"(g_tmap), "r"(local_tmap_addr)
+    );
+    asm volatile(
+        "fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
+        :: "l"(g_tmap)
+    );
+}
+```
+
+The TMA warp now only patches A and B at the top of a new group; the
+epilogue warps own the C patch:
+
+```
+// in the TMA warp's group-change branch
+tmap_update(local_A_tmap_addr, groups[group].A_addr, groups[group].M);
+tmap_update(local_B_tmap_addr, groups[group].B_addr);
+tmap_fence_proxy(g_A_tmap, local_A_tmap_addr);
+tmap_fence_proxy(g_B_tmap, local_B_tmap_addr);
+
+// in the epilogue, just before mbar_wait(mbar_addr_epi, ...)
+if (update_group && warp_id == 0 && elect_one_sync()) {
+    tmap_update(local_C_tmap_addr, groups[group].C_addr, groups[group].M);
+    tmap_fence_proxy(g_C_tmap, local_C_tmap_addr);
+}
+```
+
+`tensormap.cp_fenceproxy` is not free — it is a release fence on the
+tensormap proxy followed by an acquire, and the cost is roughly equivalent
+to a small GMEM round-trip because the descriptor lives in GMEM. Moving
+even one of the three off the critical-path-before-first-TMA-load saves
+that latency on every group boundary. The savings show up on the shapes
+where group transitions are frequent enough to be visible (shape B drops
+from 43.0us to 42.0us; shape C from 15.6us to 15.3us). The all-same-K
+shape A doesn't move because the kernel's bottleneck on that shape is
+not group transitions.
+
+Two additional small host-side changes: the host-side launch is reordered
+so `cudaMemcpyAsync` of the group descriptors is queued *before* the
+expensive `cuTensorMapEncodeTiled` template calls, letting the copy
+overlap with the driver-side encode work. NVCC build flags drop `-lineinfo`
+and add `--relocatable-device-code=false`, which can produce tighter ptxas
+register allocation and instruction scheduling.
+
+Benchmark Results:
+
+shape A -> 48.9us
+shape B -> 42.0us
+shape C -> 15.3us
+shape D -> 13.2us
+
+
+- V11 (submission_v5_iter.py) -
+
+V11 attempts inter-tile TMA pipelining: instead of draining the K-stage
+pipeline at the end of each work tile and refilling it from scratch at the
+top of the next, keep the pipeline continuously running across tile
+boundaries. Each CTA computes a sequence of (m_off, n_off) tiles, so the
+K-direction TMA loads for tile i+1 can start as soon as the consumer has
+released a stage from tile i.
+
+The state machine needed for this is a monotonically increasing
+`glob_k_off` counter that runs across tiles, plus a `first_tile` flag
+that gates the pipe-fill prologue:
+
+```
+// outside the work-tile loop
+int glob_k_off = 0;
+bool first_tile = true;
+
+// inside the work-tile loop, TMA warp
+if (first_tile) {
+    // Standard pipe-fill: pre-issue PIPE_STAGES TMA loads
+    for (int s = 0; s < PIPE_STAGES; s++) {
+        tma_load_stage(/* k_off= */ s * TD_SMEM_K, s);
+        glob_k_off += TD_SMEM_K;
+    }
+    k_off = PIPE_STAGES * TD_SMEM_K;
+    first_tile = false;
+} else {
+    k_off = 0;  // jump straight into the steady-state loop
+}
+
+for (; k_off < K; k_off += TD_SMEM_K) {
+    int stage = (glob_k_off / TD_SMEM_K) % PIPE_STAGES;
+    int wait_phase =
+        (((glob_k_off / TD_SMEM_K) / PIPE_STAGES) - 1) & 0x1;
+    mbar_wait(mbar_addr_mma + stage * 8, wait_phase);
+    tma_load_stage(k_off, stage);
+    glob_k_off += TD_SMEM_K;
+}
+```
+
+The MMA warp uses the same `glob_k_off` so that its mbarrier phase
+tracking lines up. The per-tile `mbar_init` re-init loop is removed and
+`mbar_addr_epi` becomes a normal two-phase mbarrier (`epi_phase ^= 1`)
+instead of being zeroed every tile.
+
+In theory this hides a full pipe-fill of TMA latency per tile boundary.
+In practice, on these small problem sizes the win is eaten by the new
+serial dependency it introduces: every tile's MMA now starts by waiting
+on a TMA load that was issued only one stage earlier, so there is less
+slack in the pipeline at the worst time. The measured numbers regress
+slightly on every shape (49.4 / 42.5 / 16.3 / 13.3us vs. V10's 48.9 /
+42.0 / 15.3 / 13.2). I keep V11 in the lineage because the cross-tile
+pipelining machinery becomes useful later when paired with multi-CTA
+TMEM double buffering.
+
+Benchmark Results:
+
+shape A -> 49.4us
+shape B -> 42.5us
+shape C -> 16.3us
+shape D -> 13.3us
+
+
+- Failed Experiments around V11 -
+
+submission_v5_1.py (hang). An aggressive restructure where the TMA warp
+becomes a fully-featured "admin" warp: it does the CLC try_cancel, the
+binary-search group lookup, and writes the resolved (group, m_off, n_off)
+into SMEM slots for the MMA and epilogue warps to consume, gated by new
+mbarriers `mbar_addr_tile_ready`, `mbar_addr_mma_done`, and
+`mbar_addr_epi_done`. The mbarrier arrival counts get subtly inconsistent
+(most barriers use count=1 but `mma_done` is count=2), and with
+`PIPE_STAGES = 1` there is no slack for the producer-consumer handshake
+to recover from any phase mismatch. The kernel hangs.
+
+submission_v5_iter_2.py (correctness errors). Same producer-consumer
+architecture as v5_1 but layered on top of v5_iter. Also embeds the
+groups table as `__grid_constant__ GroupDescs` (by-value, no GMEM load).
+The shape of the bug is that the TMA warp updates the per-tile metadata
+SMEM slots while the MMA and epilogue warps are still computing on the
+*previous* tile's offsets — `n_off` in particular is used inside SFB's
+TMEM address as `(n_off % 128) / 32`, and the release fence
+(`fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster`)
+does not order writes against all the consumers, so warps read torn
+offsets.
+
+submission_v5_iter_static.py (correctness errors). Strips CLC entirely
+and reverts to a static persistent loop, but keeps the v11-style
+`glob_k_off` cross-tile pipelining and adds a single-arrival
+`mbar_addr_epi_done` for an MMA<-epi handshake. The handshake is broken:
+there are `NUM_WARPS - 2 = 4` epilogue warps but the mbarrier was
+initialized with arrival count 1, so the MMA warp races ahead and
+overwrites TMEM result space before all epilogue warps finish reading.
+
+
+- Failed Experiment: submission_v5_precomp_tma.py -
+
+A side experiment to test the hypothesis that the in-kernel
+`tensormap.replace` machinery is too expensive and that pre-encoding one
+full tensormap per group on the host would be cheaper:
+
+```
+// host side
+for (int i = 0; i < G; i++) {
+    tma_3d_map_ab<...>::init(..., &h_a_tmaps[i], A_ptrs[i], M[i], K);
+    tma_3d_map_ab<...>::init(..., &h_b_tmaps[i], B_ptrs[i], N,   K);
+    tma_2d_map_c_init<...>(..., &h_c_tmaps[i], C_ptrs[i], M[i], N);
+}
+cudaMemcpyAsync(d_a_tmaps, h_a_tmaps, G * sizeof(CUtensorMap), ...);
+// ... similar for b and c
+
+// device side, on group change
+const CUtensorMap* a_tmap = &d_a_tmaps[group];
+```
+
+The kernel-side win is real (no more `tensormap.replace` or
+`cp_fenceproxy` per group change), but the host-side cost grows
+linearly in G: G calls to `cuTensorMapEncodeTiled` plus a larger H2D
+transfer. On these problem sizes the host overhead dominates and the
+kernel itself becomes 51.8 / 46.5 / 24.6 / 19.3us. Worth noting because
+the eventual winning design (V19 onward) does exactly this kind of
+per-group host-side encoding — it only works there because the
+host-side cost is amortized by other improvements made in parallel,
+and because by then the kernel-side savings from removing
+`tensormap.replace` start to outweigh the host cost.
+
+
+- V12 (submission_v5_static.py) -
+
+Steps back from CLC entirely. CLC's value is dynamic load balancing
+across heterogeneous M-sizes, but on these small problem shapes (G=2
+or G=8) the variance per CTA is small and the per-iteration
+`clusterlaunchcontrol.try_cancel` + mbar_wait costs an mbar phase wait
+on every tile. V12 launches `NUM_CTAS = 148` (one per SM on B200) and
+runs a classic static persistent loop:
+
+```
+for (int tile_idx = blockIdx.x;
+     tile_idx < total_tiles;
+     tile_idx += gridDim.x) {
+    // ... resolve group, compute, store
+}
+```
+
+Two configuration knobs flip with this change: `N_TILE_SIZE` grows
+from 128 to 256, and `PIPE_STAGES` drops from 5 to 3 (a larger N
+tile means more SMEM per stage). The larger N tile increases
+arithmetic intensity per tile and reduces the total tile count, which
+helps shapes where the kernel is MMA-bound (shape B drops from
+42.5us to 38.1us) but hurts shapes where the small total work means
+the loss of cross-tile TMA prefetch matters more than the per-tile
+gain (shape D regresses from 13.3us to 15.2us).
+
+The kernel ends each tile with a hard `__syncthreads()` + per-tile
+`mbar_init` reinit loop, which is what makes the next change
+necessary.
+
+Benchmark Results:
+
+shape A -> 54.7us
+shape B -> 38.1us
+shape C -> 19.1us
+shape D -> 15.2us
+
+
+- Failed Experiment: submission_v5_static_overlap.py -
+
+Tries to let the next tile's TMA + MMA warps start work while the
+current tile's epilogue warps are still draining. Adds a new mbar
+`mbar_addr_epi_done` for the epi -> MMA back-edge, splits the
+per-tile barrier so only the TMA and MMA warps participate in the
+mbar reinit, and lets epilogue warps fall through to the next
+iteration without participating in any inter-tile sync:
+
+```
+if (warp_id == TMA_WARP || warp_id == MMA_WARP) {
+    asm volatile("bar.sync 3, %0;" :: "r"(WARP_SIZE * 2));
+    if (warp_id == TMA_WARP && elect_one_sync()) {
+        for (int i = 0; i < PIPE_STAGES * 2; i++) mbar_init(...);
+        asm volatile("fence.mbarrier_init.release.cluster;");
+    }
+    asm volatile("bar.sync 3, %0;" :: "r"(WARP_SIZE * 2));
+}
+if (warp_id == MMA_WARP) {
+    mbar_wait(mbar_addr_epi_done, epi_done_phase);
+    epi_done_phase ^= 1;
+}
+```
+
+The kernel faults. The root cause is that there is still only one
+TMEM result region; epilogue(tile N) is reading from
+`tmem_addr_result` while MMA(tile N+1) is issuing
+`tcgen05.mma ... enable_input_d=0` against the same address,
+zeroing it under the epilogue's feet. The phase-bookkeeping on
+`mbar_addr_epi` is also fragile because the epilogue warps don't
+participate in the mbar reinit but do read the mbar's phase counter.
+The fix needs a TMEM ping-pong, which V13 provides.
+
+
+- V13 (submission_v5_static_overlap_2.py) -
+
+Same overlap idea as the failed kernel above, but with the missing
+piece in place: two TMEM result regions and two pairs of (epi,
+epi_done) mbarriers, indexed by a per-warp `tmem_buf` that toggles
+each tile.
+
+```
+tcgen05_alloc_tmem<1>(tmem_addr_ptr, TD_MMA_N * 2 * 2);  // doubled
+
+const int tmem_result_ptrs[2] = {
+    tmem_addr_base,
+    tmem_addr_base + 2 * TD_MMA_N
+};
+const int tmem_sfa_ptrs[2] = {
+    tmem_result_ptrs[0] + TD_MMA_N,
+    tmem_result_ptrs[1] + TD_MMA_N
+};
+const int tmem_sfb_ptrs[2] = {
+    tmem_sfa_ptrs[0] + (TD_MMA_M / 32) * (TD_SMEM_K / 64),
+    tmem_sfa_ptrs[1] + (TD_MMA_M / 32) * (TD_SMEM_K / 64)
+};
+
+int tmem_buf = 0;
+int epi_phase[2]      = {0, 0};
+int epi_done_phase[2] = {0, 0};
+
+// MMA warp's per-tile prologue, gated by first_tile so the very first
+// iteration doesn't wait on a back-edge that hasn't fired yet
+if (warp_id == MMA_WARP) {
+    tmem_buf ^= 1;
+    if (!first_tile) {
+        mbar_wait(mbar_addr_epi_done + tmem_buf * 8,
+                  epi_done_phase[tmem_buf]);
+        epi_done_phase[tmem_buf] ^= 1;
+    } else {
+        first_tile = false;
+    }
+}
+
+// MMA emits results to the current tmem_buf
+// Epilogue reads from the same tmem_buf, signals epi_done at the end
+```
+
+With two TMEM result halves, MMA(tile N+1) writes one half while
+epilogue(tile N) reads the other; the long TMEM->reg->half->SMEM->TMA
+chain now overlaps with the K-loop of the next tile. Configuration
+returns to N=128 / PIPE=5 because the doubled TMEM allocation forces
+TD_MMA_N=128 (TMEM column budget is exhausted at 512 cols).
+
+A small but important PTX detail used throughout V12+ is the *named
+barrier* form of `bar.sync`:
+
+```
+bar.sync     a {, b};
+bar.arrive   a, b;
+
+  a — barrier resource (0..15)
+  b — number of threads participating
+```
+PTX link: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-bar
+
+CUDA's `__syncthreads()` compiles to `bar.sync 0` and synchronizes every
+thread in the CTA. The two-operand form `bar.sync N, M` synchronizes only
+M threads on barrier resource N, where N is a small integer (0-15). This
+is how the kernel synchronizes *only the epilogue warps* without
+involving the TMA and MMA warps, e.g.:
+
+```
+asm volatile("bar.sync 2, %0;" :: "r"(WARP_SIZE * (NUM_WARPS - 2)) : "memory");
+```
+
+waits for `WARP_SIZE * (NUM_WARPS - 2)` threads — i.e. the four epilogue
+warps. Different barrier resources are used for different role-groups
+(barrier 2 for epilogue, barrier 3 for TMA+MMA in V12+) so that one role
+group can synchronize among itself while another is independently
+running.
+
+Benchmark Results:
+
+shape A -> 45.9us
+shape B -> 35.5us
+shape C -> 15.3us
+shape D -> 13.2us
+
+
+- V14 (sub_v6.py) -
+
+V14 (the start of the v6 family) takes a host-side optimization that
+pays off everywhere: stop transferring the GroupDesc array via
+cudaMemcpyAsync, and instead pass it by value as a
+`__grid_constant__` kernel argument. The size limit on a kernel
+argument is 32KB and the GroupDescs fits in well under that bound:
+
+```
+struct GroupDescs {
+    GroupDesc groups[MAX_G];   // MAX_G = 8
+};
+
+void nvfp4_group_gemm(...) {
+    GroupDescs gd = {};
+    for (int i = 0; i < G; i++) {
+        gd.groups[i].A_addr   = A_ptrs[i];
+        gd.groups[i].B_addr   = B_ptrs[i];
+        gd.groups[i].C_addr   = C_ptrs[i];
+        gd.groups[i].sfa_addr = sfa_ptrs[i];
+        gd.groups[i].sfb_addr = sfb_ptrs[i];
+        gd.groups[i].M        = M_sizes[i];
+    }
+    kernel_inst<<<NUM_CTAS, threads>>>(gd, tmap_a_temp, ...);
+}
+```
+
+`__grid_constant__` arguments live in a special constant memory bank
+that's broadcast to all CTAs; it's free to read on the device side
+and free to ship on the host side (the driver folds it into the
+launch parameters that travel through the existing launch path). This
+eliminates one `cudaMemcpyAsync` and the static
+`cudaMallocHost / cudaMalloc` pair entirely.
+
+V14 also trims back the per-tile sync to a single
+`mbar_addr_epi_done` and drops the temporary loss of TMEM
+ping-ponging (single TMEM result region) to keep the diff
+isolated to the host-side change. `NUM_CTAS` is now
+`min(total_tiles, 148)` to avoid launching CTAs that have no
+work.
+
+Benchmark Results:
+
+shape A -> 43.6us
+shape B -> 33.5us
+shape C -> 14.3us
+shape D -> 10.5us
+
+
+- V15 (sub_v6_1.py) -
+
+Re-introduces the cross-tile TMA pipelining from V11 — this time on
+top of the cleaner static-persistent scheduling of V14. The state
+machine is the same `glob_k_off` running counter, with the
+first-tile prefetch and steady-state pipe consumption:
+
+```
+int glob_k_off = 0;
+bool first_tile = true;
+constexpr int prefetch_stages = PIPE_STAGES;
+
+for (int tile_idx = blockIdx.x; tile_idx < total_tiles;
+     tile_idx += gridDim.x) {
+    // ... resolve tile ...
+
+    if (warp_id == TMA_WARP) {
+        if (first_tile) {
+            for (int s = 0; s < prefetch_stages; s++) {
+                tma_load_stage(/* k_off= */ s * TD_SMEM_K, s);
+            }
+            k_off = TD_SMEM_K * prefetch_stages;
+            glob_k_off = k_off;
+            first_tile = false;
+        } else {
+            k_off = 0;
+        }
+        for (; k_off < K; k_off += TD_SMEM_K) {
+            int stage = (glob_k_off / TD_SMEM_K) % PIPE_STAGES;
+            int wait_phase =
+                (((glob_k_off / TD_SMEM_K) / PIPE_STAGES) - 1) & 0x1;
+            mbar_wait(mbar_addr_mma + stage * 8, wait_phase);
+            tma_load_stage(k_off, stage);
+            glob_k_off += TD_SMEM_K;
+        }
+    }
+    // MMA warp uses the same glob_k_off
+}
+```
+
+The MMA warp consumes stages from the same `glob_k_off`, so when
+tile i finishes its K-loop the next iteration's first
+`mbar_wait` simply consumes one of the prefetched stages
+issued from tile i+1's TMA loads. Combined with the alignment
+fix `alignas(128) CUtensorMap` for the SMEM tensor map and a
+`fence.proxy.async.shared::cta` before each TMA store, the
+sub-microsecond wins land on shapes B and D's middle case
+(33.5 -> 33.0us).
+
+The proxy fence is needed because the epilogue writes SMEM
+through the generic proxy (ordinary half2 stores) while the TMA
+engine reads SMEM through the async proxy; without an explicit
+proxy fence the TMA can read stale SMEM. The proxy framework
+itself is touched on in summary.txt's V6 (tensormap proxy via
+`tensormap.cp_fenceproxy`) and V8 (async vs generic proxy in CLC)
+entries, and listed under the Memory Consistency Details glossary
+section.
+
+Benchmark Results:
+
+shape A -> 43.6us
+shape B -> 33.0us
+shape C -> 14.3us
+shape D -> 10.5us
+
+
+- V16 (sub_v6_2.py) -
+
+Re-introduces TMEM ping-ponging from V13, stacked on V15's
+cross-tile TMA pipelining:
+
+```
+tcgen05_alloc_tmem<1>(tmem_addr_ptr, TD_MMA_N * 2 * 2);
+
+const int tmem_result_ptrs[2] = {base, base + 2 * TD_MMA_N};
+const int tmem_sfa_ptrs[2]    = { result_ptrs[0] + TD_MMA_N,
+                                  result_ptrs[1] + TD_MMA_N };
+// ... two epi / epi_done mbars
+
+// MMA tail: signal current tmem_buf, wait for the previous tmem_buf
+tcgen05_commit(mbar_addr_epi + 8 * tmem_buf);
+// ...
+mbar_wait(mbar_addr_epi_done + tmem_buf * 8,
+          epi_done_phase[tmem_buf]);
+```
+
+Now MMA(tile N+1) can write into one TMEM half while
+epilogue(tile N) drains the other, *and* TMA loads for tile
+N+1 are already in flight from the V15 cross-tile pipelining.
+All three phases — TMA, MMA, epilogue — overlap across tile
+boundaries. The benchmark moves uniformly by about 2us on the
+larger shapes (shape B 33.0 -> 31.1us) and 0.5us on the smaller
+ones (shape C 14.3 -> 13.9us). The smaller shapes benefit less
+because they don't have enough tiles to amortize the overlap
+benefit.
+
+Benchmark Results:
+
+shape A -> 41.8us
+shape B -> 31.1us
+shape C -> 13.9us
+shape D -> 10.5us
+
+
+- V17 (sub_v6_2_3.py) -
+
+The largest single-step improvement in the v6 family. Three
+changes stack:
+
+(1) Cluster of two CTAs with TMA multicast of A. The kernel
+launches with `__cluster_dims__(2, 1, 1)` and only the leader
+CTA issues the A load:
+
+```
+__device__ inline void tcgen05_3dtma_g2s_ab_multicast(
+        int smem_ptr, const CUtensorMap* tmap,
+        int m_off, int k_off, int mbar_addr,
+        uint16_t cluster_mask) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::"
+        "complete_tx::bytes.multicast::cluster.cta_group::1.L2::"
+        "cache_hint [%0], [%1, {%2, %3, 0}], [%4], %5, %6;"
+        :
+        : "r"(smem_ptr), "l"(tmap), "r"(k_off), "r"(m_off),
+          "r"(mbar_addr), "h"(cluster_mask), "l"(L2_CACHE_HINT)
+    );
+}
+```
+
+The full multicast-TMA instruction syntax (with `.multicast::cluster`
+listed as an option) is already shown in the basic GEMM section. The
+key new behavior versus the non-multicast form: when
+`.multicast::cluster` is present the instruction takes an extra
+`ctaMask` operand (the `"h"(cluster_mask)` above) — a 16-bit
+bitfield where bit `i` set means "deliver this TMA's data to CTA `i`
+in the cluster, into the same SMEM offset, and arrive on each of
+those CTAs' mbarriers". The TMA engine reads from HBM/L2 exactly
+once and fans out via the cluster interconnect (DSMEM path), so we
+pay HBM bandwidth for one CTA's worth of A and get both CTAs
+filled. The `complete_tx` arrival happens on every receiving CTA,
+which is why every receiving CTA's `mbar_init` arrival count has to
+be bumped from 1 to CLUSTER_SIZE — otherwise the consumer side
+under-counts arrivals and `mbar_wait` never returns.
+
+The corresponding `tcgen05.commit` uses the multicast scope so a
+single MMA completion releases the shared mbarrier on every CTA in
+the cluster (the non-multicast form is the one shown in the basic
+GEMM kernel):
+
+```
+tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.
+                                  multicast::cluster.b64 [%0], %1;
+```
+
+Two paired mbarrier-side details follow from the multicast:
+
+(a) The basic-GEMM `mbarrier.arrive.expect_tx` helper is scoped to
+`.shared::cta`, which can only arrive on a barrier local to this
+CTA. With multicast, the producing CTA must signal an mbarrier that
+the *receiving* CTAs see, so the helper is upgraded to
+`.shared::cluster` — the mbarrier address is interpreted as a DSMEM
+address that may live on a peer CTA, and the arrival routes through
+the cluster interconnect.
+
+(b) On a group transition the producer warp emits the standard
+`fence.mbarrier_init.release.cluster` (already seen in the basic
+GEMM kernel setup) so the new mbarrier state is visible to peer
+CTAs before they read it.
+
+(2) Pre-built per-group tensormaps in `GroupDesc`. The
+in-kernel `tensormap.replace` + `cp_fenceproxy` chain is
+gone. Tensormaps are encoded on the host once per group and
+shipped with the GroupDescs struct:
+
+```
+struct GroupDesc {
+    uint64_t A_addr, B_addr, C_addr, sfa_addr, sfb_addr;
+    int M;
+    CUtensorMap tmap_a, tmap_b, tmap_c;
+};
+
+// host side
+for (int i = 0; i < G; i++) {
+    tma_3d_map_ab<M_TILE_SIZE, K_TILE_SIZE, ...>::init(
+        ..., &gd.groups[i].tmap_a, A_ptrs[i], M[i], K);
+    tma_3d_map_ab<N_TILE_SIZE, K_TILE_SIZE, ...>::init(
+        ..., &gd.groups[i].tmap_b, B_ptrs[i], N,    K);
+    tma_2d_map_c_init<M_TILE_SIZE, OUT_N_CHUNK>(
+        ..., &gd.groups[i].tmap_c, C_ptrs[i], M[i], N);
+}
+```
+
+Because the whole GroupDescs struct is a `__grid_constant__`
+argument (from V14), shipping the tensormaps adds nothing to
+the launch cost. On the device side, group transitions are
+just `&groups[cur_group].tmap_a` — no replace, no fenceproxy,
+no GMEM round-trip. This is exactly the experiment that
+failed as a standalone change in submission_v5_precomp_tma.py,
+but here it works because the cluster + multicast improvements
+have grown the kernel's runtime so the constant host-side
+encode cost is amortized.
+
+(3) A dedicated tile-descriptor warp. With NUM_WARPS=7 the new
+warp precomputes `(group, m_off, n_off, sfa_addr, sfb_addr, M)`
+for each upcoming tile and publishes them through five SMEM
+slots gated by an `mbar_addr_tile_ready` mbarrier. This kills
+the redundant binary-search-for-group work that every other
+warp used to do, and overlaps it with the previous tile's MMA.
+
+Benchmark Results:
+
+shape A -> 38.3us
+shape B -> 24.9us
+shape C -> 12.8us
+shape D ->  9.1us
+
+
+- Failed Experiment: sub_v6_2_descoverlap.py -
+
+Tries the same dedicated tile-descriptor producer warp from V17
+but layered on top of V16, which still has the
+`tensormap.replace` machinery. The tile-descriptor warp now does
+three `tmap_update` + three `tmap_fence_proxy` per tile, writing
+to per-stage GMEM tmap slots `g_A_tmap + tile_stage`. The
+intent was to pipeline descriptor preparation across tiles. But
+the GPU-scope `tensormap.cp_fenceproxy ... gpu` is a heavy
+serializer at L2/GPU scope, and doing three of them per tile in
+the steady state turns out to be much worse than doing three
+per *group transition* — which is what V16 did. The benchmark
+explodes to 59.3 / 42.7 / 21.5 / 16.7us. V17 only avoided this
+landmine because it had simultaneously eliminated
+`tensormap.replace` entirely.
+
+Failed Experiment: sub_v6_2_multicast.py (hang). A standalone
+multicast attempt without the supporting mbar arrival-count fixes
+and without the cluster-scope commit. With multicast TMA delivering
+to both CTAs but the mbarriers still initialized for single-CTA
+arrival counts, the consumer's `mbar_wait` never sees enough
+arrivals and the kernel hangs forever. This is the cautionary
+lesson that the multicast / arrive-count / commit-scope changes
+need to land together.
+
+Failed Experiment: sub_v6_3.py (correctness errors). Adds a
+transposed-output path: TMA loads stay the same, but the MMA
+swaps A and B, the result is computed effectively as B^T @ A in
+TMEM, and the epilogue stores into a transposed C using
+`tensormap.replace.tile.global_stride` to patch the per-dim byte
+stride (the full set of replaceable fields — `global_dim`,
+`global_address`, `global_stride`, `element_stride`, etc. — was
+listed in V6 / submission_v4_2.py). A transposed C needs both a
+different shape *and* a different stride, which is why both
+`global_dim` and `global_stride` get patched here. The SF TMEM
+layout doesn't get the matching swap (`tmem_sfa_ptrs` still uses
+`TMEM_SF_COLS = TD_MMA_N` for stride math but the MMA passes
+sfa/sfb swapped), and the epilogue's `tcgen05_ld<16, 256, ...>`
+pattern assumes results are laid out along the original M-axis.
+
+Failed Experiment: sub_v6_splitk.py (hang). Split-K experiment
+with SPLIT_K=4, K_TILE_SIZE=64, PIPE_STAGES=15, and a 4-way
+TMEM circular buffer. The epilogue is replaced with an
+`atomicAdd` into a pre-allocated reduction buffer. The hang
+comes from the producer's `glob_k_off` continuing absolutely
+across shards while the consumer expects per-shard phase
+resets; subsequent shards' `mbar_wait` end up waiting on
+already-flipped phases.
+
+Failed Experiment: sub_v6_tmem_circ.py (hang). A 4-deep TMEM
+ring without split-K. mbarrier phase bits only track a single
+toggle, so the producer-consumer phase agreement for a 4-cycle
+ring is fragile. The `init_tmem_fill > 3` warmup gate
+introduces an off-by-one in when the wait actually starts,
+and the producer and consumer end up disagreeing about which
+phase they're in.
+
+
+- V18 (sub_v6_3_test.py) -
+
+A small follow-up to v6_3 that improves the transposed-output
+epilogue specifically. Switches to a different `tcgen05.ld` shape
+(the full instruction with all `.shape` / `.num` options is shown
+in the basic GEMM section). The earlier epilogues used `.16x256b`
+with `.x8/.x16/.x32` (16 rows wide, 256 bits per "load atom"). The
+transposed-output epilogue uses `.32x32b` with `.x32`, meaning 32
+rows of 32-bit data per atom and 32 atoms per instruction — each
+lane ends up with a tall column of values which is exactly what
+column-major SMEM staging wants. The two shapes correspond to very
+different physical TMEM access patterns; choosing the wrong one
+forces a transpose-in-registers (extra shuffles or extra SMEM
+round-trip), which is the cost v6_3 was paying before this fix.
+
+Each thread now accumulates 32 register values that form a
+column of OUT_CHUNK halves, then stores them column-major into
+SMEM at `c_smem + i * TD_SMEM_N + threadIdx.x`. SF tmem
+indexing is also fixed (`int sfa_tmem = tmem_addr_sfa + 4 *
+sub_k_iter + (m_off % 128) / 32`). Bumps CTAS_PER_SM=2 (296
+total CTAs).
+
+V18 passes correctness, but it's not on the cluster-multicast
+path (it's `__cluster_dims__(1, 1, 1)`) and it still pays the
+runtime `tensormap.replace` cost on group boundaries, so the
+numbers are worse than V17. It's kept as a working baseline
+for the transpose layout experiments.
+
+Benchmark Results:
+
+shape A -> 46.3us
+shape B -> 35.8us
+shape C -> 14.9us
+shape D -> 12.5us
+
+
+- V19 (sub_v7.py) -
+
+V19 is a flexibility checkpoint, not a perf win. The intent is
+to put the runtime `tensormap.replace` machinery back so that
+the kernel can support per-group varying N and K (V17's
+pre-encoded tensormap path bakes N and K into the host-side
+encode call). To make the comparison clean V19 strips the
+multicast path and runs with `__cluster_dims__(1, 1, 1)`. It
+also adds a `TRANSPOSE` template parameter that flips A and B
+in the MMA instruction.
+
+The descriptor patching is per-CTA, per-stage, with the
+heavyweight GPU-scope fence:
+
+```
+"tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;"
+"tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [%0], [%1], 128;"
+```
+
+published into a per-CTA GMEM tensormap cache:
+
+```
+CUtensorMap* d_tmaps;
+cudaMalloc(&d_tmaps, 3 * TILE_DESC_PIPE_STAGES * NUM_CTAS * sizeof(CUtensorMap));
+// per-CTA: g_A_tmap = d_tmaps + 3 * TILE_DESC_PIPE_STAGES * blockIdx.x
+```
+
+The regression vs. V17 (~3us across all shapes) is the cost of
+re-introducing the per-tile descriptor patching plus the loss of
+TMA multicast on A. This is the inverse of the
+descoverlap regression: V19 has only the descriptor-patching
+cost, and that alone is ~3us; descoverlap had the patching cost
+*and* did three patches per tile (vs. one per group transition
+here), and that was ~20us.
+
+Benchmark Results:
+
+shape A -> 41.3us
+shape B -> 27.8us
+shape C -> 14.8us
+shape D -> 12.4us
+
+
+- Failed Experiments: sub_v8.py, sub_v8_1.py -
+
+sub_v8.py (fails correctness). Re-adds the 2-CTA cluster on top
+of V19's transposed `tensormap.replace` machinery, plus a 2SM
+tcgen05 MMA (`tcgen05.mma.sp.async.cta_group::2.kind::mxf4nvf4`).
+This is a fundamentally different multicast mode from V17:
+`cta_group::2` (covered in detail in the Dual GEMM V2 section)
+means the MMA itself is 2-CTA — each CTA in the cluster owns half
+of the TMEM result and the tensor cores collaborate across the SM
+boundary via the cluster interconnect. The effective N of the
+instruction descriptor doubles
+(`make_instr_desc<TD_MMA_N * CTA_GROUP, TD_MMA_M>()`), and the TMEM
+result is striped across both CTAs: CTA0 holds the left half along
+N, CTA1 holds the right half. Producer-consumer synchronization
+across the cluster uses the same
+`barrier.cluster.arrive.release.aligned` / `barrier.cluster.wait
+.acquire.aligned` pair shown in Dual GEMM V2.
+
+The arrive-count on TMA producer mbars is bumped to CLUSTER_SIZE
+to account for the multicast arrivals, and only the leader CTA
+issues MMAs. There are two bugs: (1) a precedence issue in
+`mbar_addr_tma + stage * 8 & 0xFEFFFFFF` (the `&` binds wider
+than intended and corrupts the address), and (2) the cta_rank
+indexing in the epilogue's TMEM load reads from CTA1's TMEM half
+even though the result is in CTA0's TMEM. Either alone would
+cause incorrect output.
+
+sub_v8_1.py (fails correctness). Switches the scale-factor TMA
+from 1D bulk to a true 3D tensor descriptor:
+
+```
+"cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::"
+"complete_tx::bytes.cta_group::%0.L2::cache_hint "
+"[%1], [%2, {%3, %4, %5}], [%6], %7;"
+```
+
+with a corresponding `tma_3d_map_sf` encoder using rank-3 shape
+`{256, 2 * (k_dim_gmem_sf / 4), mn_dim_gmem / 128}`. The kernel
+is checked in with a debug stub still in place:
+
+```
+for (int chunk = 0; chunk < 0; chunk++)  // !!!
+    /* TMEM->SMEM->TMA store loop */
+```
+
+so the entire epilogue is short-circuited and no results ever
+get written. Once that stub is fixed there are likely additional
+issues in the new 3D SF descriptor's stride/box layout, but the
+proximate failure is just the dead loop.
+
+
+- V20 (v0.py) -
+
+V20 is a recovery: drop the failed 2-CTA / SF-3D-TMA experiments
+and keep V19's `tensormap.replace` machinery but pair it with TMA
+multicast on A:
+
+```
+tcgen05_3dtma_g2s_ab_multicast<1, CLUSTER_MASK>(
+    a_smem_stage_ptr, g_A_tmap + tile_stage,
+    m_off, k_off, mbar_addr, CLUSTER_MASK);
+// ... B is non-multicast
+tcgen05_commit_multicast<CLUSTER_MASK>(...);
+```
+
+It also adds two specialization knobs:
+
+  NK_VAR=true        -> generalize to per-group varying N and K
+                        by calling tmap_update_dim<1>,
+                        tmap_update_dim<2>, tmap_update_stride<0>
+                        on each group transition.
+  SINGLE_WAVE=true   -> when total_tiles < 148, elide the
+                        back-half of the epilogue mbar wait
+                        because there is no wave-2.
+
+Four kernel template instantiations are compiled, and the host
+wrapper picks one based on (NK_VAR, SINGLE_WAVE). This is the
+state of the kernel right before the next big simplification.
+
+Benchmark Results:
+
+shape A -> 40.6us
+shape B -> 26.4us
+shape C -> 14.1us
+shape D -> 10.6us
+
+
+- V21 (v1.py) -
+
+V21 throws out the `tensormap.replace` machinery entirely (again)
+and goes back to per-group pre-encoded tensormaps embedded in
+`GroupDesc`, like V17, but this time preserving the NK_VAR
+capability — the per-group encode happens on the host with each
+group's actual M, N, K, so variable N/K is supported naturally
+without needing in-kernel descriptor patching:
+
+```
+// host side
+for (int i = 0; i < G; i++) {
+    tma_3d_map_ab<M_TILE_SIZE, K_TILE_SIZE, ...>::init(
+        ..., &gd.groups[i].tmap_a, A_ptrs[i], M[i], K_sizes[i]);
+    tma_3d_map_ab<N_TILE_SIZE, K_TILE_SIZE, ...>::init(
+        ..., &gd.groups[i].tmap_b, B_ptrs[i], N_sizes[i], K_sizes[i]);
+    tma_2d_map_c_init<...>(..., &gd.groups[i].tmap_c,
+                          C_ptrs[i], M[i], N_sizes[i]);
+}
+
+// device side (no SMEM tmap, no fenceproxy)
+tcgen05_3dtma_g2s_ab_multicast<1, CLUSTER_MASK>(
+    a_smem_stage_ptr, &groups[cur_group].tmap_a, ...);
+tcgen05_3dtma_g2s_ab<1>(
+    b_smem_stage_ptr, &groups[cur_group].tmap_b, ...);
+tcgen05_2dtma_s2g_c(
+    ..., &groups[cur_group].tmap_c, ...);
+```
+
+This removes the `local_A_tmap` / `local_B_tmap` / `local_C_tmap`
+SMEM copies, the `tmap_fence_proxy`, the `d_tmaps` GMEM cache,
+and the entire NK_VAR `tmap_update_dim<...>` block. The
+producer warp issues TMA loads directly against the
+constant-memory-resident descriptor.
+
+V21 matches V19's runtime (38.2us on shape A) while preserving
+NK_VAR. It enables V22.
+
+Benchmark Results: (same as v2.py below)
+
+
+- V22 (v2.py) -
+
+Adds a third TMEM result buffer, deepening the MMA<-epilogue
+pipeline from 2-buffered to 3-buffered:
+
+```
+tcgen05_alloc_tmem<1>(tmem_addr_ptr, 512);   // was TD_MMA_N * 2 * 2
+
+const int tmem_result_ptrs[3] = {
+    tmem_addr_base,
+    tmem_addr_base + TD_MMA_N,
+    tmem_addr_base + 2 * TD_MMA_N
+};
+const int tmem_sfa_ptrs[3] = {
+    tmem_result_ptrs[2] + TD_MMA_N,
+    tmem_result_ptrs[2] + TD_MMA_N + 16,
+    tmem_result_ptrs[2] + TD_MMA_N + 32
+};
+const int tmem_sfb_ptrs[3] = {
+    tmem_sfa_ptrs[2] + 16,
+    tmem_sfa_ptrs[2] + 32,
+    tmem_sfa_ptrs[2] + 48
+};
+
+// rotation: tmem_buf = (tmem_buf + 1) % 3, was tmem_buf ^= 1
+// epi_phase[3], epi_done_phase[3]
+
+// primed flag replaces tile_idx != blockIdx.x as the guard for
+// waiting on mbar_addr_epi_done
+```
+
+With three TMEM result slots the MMA warp can keep issuing
+`tcgen05.mma` into a fresh slot while two prior tiles are
+still being consumed by the epilogue. This fully hides the
+TMEM->reg->half->SMEM->TMA store chain on wave-bound shapes.
+
+The TMEM allocation grows from `TD_MMA_N * 2 * 2 = 512` cols
+to a hard-coded `512` cols (= TD_MMA_N * 3 results + 3 * SF
+slots), so the TMEM budget is at the boundary; further
+deepening would require a different SF layout.
+
+Benchmark Results:
+
+shape A -> 38.2us
+shape B -> 25.2us
+shape C -> 12.8us
+shape D ->  9.1us
+
+
+- V23 (v3.py) - Final -
+
+A host-side launch-overhead micro-optimization. The previous
+versions extract A/B/C raw pointers from the per-group
+`std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>` on the
+C++ side, which costs a pybind11/ATen ABI hop and a refcount
+check per call. V23 pulls those `data_ptr()` calls up into
+Python where they're folded into a single list comprehension,
+then passes three uint64 CPU tensors:
+
+```
+# Python wrapper
+A_ptrs = torch.tensor([a.data_ptr() for (a, b, c) in abc_tensors],
+                      dtype=torch.uint64, device='cpu')
+B_ptrs = torch.tensor([b.data_ptr() for (a, b, c) in abc_tensors],
+                      dtype=torch.uint64, device='cpu')
+C_ptrs = torch.tensor([c.data_ptr() for (a, b, c) in abc_tensors],
+                      dtype=torch.uint64, device='cpu')
+nvfp4_group_gemm(A_ptrs, B_ptrs, C_ptrs, sf_tensors,
+                 prob_sizes, N, K, G)
+```
+
+```
+// C++ entry
+void nvfp4_group_gemm(torch::Tensor A_ptrs, torch::Tensor B_ptrs,
+                      torch::Tensor C_ptrs, ...) {
+    uint64_t* A_ptrs_data = A_ptrs.data_ptr<uint64_t>();
+    // ... encode tmaps from raw pointers
+    tma_3d_map_ab<...>::init(..., &gd.groups[i].tmap_a,
+        reinterpret_cast<void*>(A_ptrs_data[i]), M[i], K);
+}
+```
+
+Note that V5 (submission_v4_1.py) had measured this kind of
+change as net-zero. The difference here is that by V23 the
+kernel itself is fast enough (~9us on shape D) that even
+sub-microsecond host overhead changes are detectable. The
+kernel body, PTX, TMEM layout, mbarrier pipeline, and template
+instantiations are identical to V22 — the win comes entirely
+from launch-overhead reduction.
+
+Benchmark Results:
+
+shape A -> 38.2us
+shape B -> 25.2us
+shape C -> 12.8us
+shape D ->  9.1us
+
+
+--- Summary of the v6_2_3 / v3 winning recipe ---
+
+Stripped of the dead branches, the final winning kernel stacks
+the following independent improvements, each of which was
+discovered in isolation but only paid off when combined:
+
+  1. Persistent buffers across calls (V3): no allocator on the
+     hot path.
+  2. Single kernel launch covering all GEMMs (V1), with
+     fixed-N/K specialization for benchmark shapes (V4).
+  3. Static persistent scheduling with 148 CTAs (V12, V14).
+  4. Per-CTA TMA descriptor patching via `tensormap.replace`
+     scaled poorly; pre-encoded per-group tensormaps embedded
+     in a `__grid_constant__` GroupDescs struct scale to any G
+     for free (V14 + V17/V21).
+  5. TMA store of C via `cp.async.bulk.tensor` (V7) with
+     OUT_N_CHUNK-chunked double-buffered SMEM staging using
+     `cp.async.bulk.wait_group.read N` (V9) to overlap C
+     conversion and TMA store.
+  6. Cross-tile TMA pipelining via a monotonic glob_k_off
+     counter and a first-tile prefetch (V11/V15).
+  7. Multi-buffered TMEM results (2-deep in V13/V16, 3-deep in
+     V22) so MMA on tile N+k overlaps epilogue on tile N.
+  8. Two-CTA cluster with TMA multicast on A and
+     cluster-scope `tcgen05.commit` (V17).
+  9. Dedicated tile-descriptor producer warp that resolves
+     (group, m_off, n_off, sfa, sfb, M) once per tile and
+     publishes via SMEM (V17).
+ 10. Host-side launch path: `cudaMallocHost` + pinned
+     `cudaMemcpyAsync` (V9), then eliminated entirely once
+     GroupDescs became a `__grid_constant__` argument (V14).
+ 11. Pre-extract data_ptr()s in Python to skip the per-tuple
+     pybind11 unpacking on the C++ side (V23).
+
+The biggest single-step wins, in order: TMA store (V7,
+-40us), tensormap.replace removal + multicast + tile-descriptor
+warp (V17, -3us on a 31us baseline), and TMEM ping-pong (V16,
+-2us). The biggest correctness traps were all in the
+multi-CTA / multi-buffer space: arrive-count and phase-bit
+invariants must be updated together with every change to the
+producer-consumer arity.
+
+
+--- New Concepts (additions to the existing Glossary) ---
+
+The Glossary at the end of summary.txt covers concepts that show up
+across the GEMM, Dual GEMM, and earlier Group GEMM iterations
+(including TMA, mbarriers, memory consistency / proxies, cluster /
+DSMEM, CTA_GROUP, warp specialization, software pipelining, pinned
+host memory under "Host/Device Data Transfer Details", etc.). The
+concepts below first appear in V9 onward and aren't already covered
+there.
+
+-> Cluster Multicast TMA
+   `cp.async.bulk.tensor.{...}.multicast::cluster.{...}` issues a
+   single TMA load from HBM and fans the data out to multiple CTAs
+   in a cluster via the cluster interconnect. A 16-bit `ctaMask`
+   selects which CTAs in the cluster receive the data. The mbarrier
+   that tracks completion must be initialized with an arrival count
+   equal to the number of receiving CTAs, since each receiving CTA's
+   mbarrier records an arrival. Used in V17 to halve HBM traffic on
+   the A operand. (The `.multicast::cluster` qualifier is listed in
+   the basic GEMM section's TMA discussion; this glossary entry
+   covers what changes around it.)
+
+-> TMEM Multi-buffering / Ping-pong
+   Allocating 2 or 3 distinct TMEM regions for results, indexed by
+   a rotating `tmem_buf` counter. Lets the MMA warp write into one
+   region while the epilogue warps read from another, decoupling
+   the long TMEM->reg->half->SMEM->TMA chain from the MMA critical
+   path. 2-deep in V13/V16, 3-deep in V22. Each TMEM region needs
+   its own `epi` / `epi_done` mbarriers with independent phase
+   counters; getting the phase tracking wrong is the most common
+   correctness/hang trap (sub_v6_tmem_circ, v5_static_overlap).
+
+-> Cross-tile TMA Pipelining
+   Carrying TMA pipeline state across work-tile boundaries using a
+   monotonic `glob_k_off` counter plus a `first_tile` prologue.
+   Eliminates the per-tile pipe-fill stall. Requires the TMA
+   producer mbarriers to be reusable across tiles (not re-init'd at
+   each tile boundary) and the consumer's mbarrier phase tracking
+   to be derived from `glob_k_off / TD_SMEM_K`. Introduced in V11,
+   stabilized in V15.
+
+-> Tile-descriptor Producer Warp (extension of Warp Specialization)
+   Builds on the existing Warp Specialization concept. A dedicated
+   warp resolves `(group, m_off, n_off, sfa_addr, sfb_addr, M)` for
+   each upcoming work tile and publishes the values via SMEM slots
+   gated by an `mbar_addr_tile_ready` mbarrier. Removes redundant
+   binary-search-for-group work from every other warp and overlaps
+   the resolution with the previous tile's MMA. Introduced in V17.
+
+-> __grid_constant__ Kernel Arguments
+   A CUDA C++ qualifier on a kernel parameter that places the
+   argument in a constant-memory bank broadcast to all CTAs in the
+   grid. Free to read on the device side, free to ship from host
+   (folded into the existing launch-parameter path, capped at
+   ~32KB). Used in V14 to pass the entire per-group descriptor
+   table (`GroupDescs` struct of up to `MAX_G` slots, including
+   pre-encoded tensormaps in V17+) without any `cudaMemcpy`.
+
+-> Named Barriers (bar.sync N, M)
+   `bar.sync` with explicit barrier-resource ID `N` (0..15) and
+   thread count `M`. Lets a subset of warps synchronize among
+   themselves without involving the rest of the CTA. The kernel
+   uses barrier 2 for the four epilogue warps and barrier 3 for
+   the TMA+MMA warps so each role group can ping-pong
+   independently. (CUDA's `__syncthreads()` is the special case of
+   barrier 0 with the whole CTA participating, which is what
+   summary.txt has used up to this point.)
+
+-> Cluster-scope Mbarrier Arrivals
+   `mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64` —
+   the `.shared::cluster` qualifier reinterprets the mbarrier
+   address as DSMEM (an SMEM address that may live on a peer CTA).
+   Required so that a producer CTA can arrive on an mbarrier
+   located on a consumer CTA in a multicast / multi-CTA setup.
+   (Distinct from the `.shared::cta` form used by the basic GEMM
+   kernel's `mbar_arrive_expect` helper.)
+
